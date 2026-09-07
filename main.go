@@ -1088,9 +1088,17 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 	// If any confirmed playback is active (IsHealthy), tighten the limit to 5 slots
 	// so the scan cannot consume memory that the active stream needs.
 	// Without active playback, allow up to MasterConcurrencyLimit-5 (default 20).
+	// Both branches floor at 1: MasterConcurrencyLimit can be set well below 5 (the
+	// panel used to enforce a minimum of 5 for exactly this reason), and an
+	// unclamped subtraction going negative made the saturation check below always
+	// true — denying every never-yet-confirmed playback a pump slot forever, since
+	// a brand new request can't reach IsHealthy without first being allowed to pump.
 	canTakeSlot := true
 	if !isHealthy {
 		scanLimit := gc().MasterConcurrencyLimit - 5
+		if scanLimit < 1 {
+			scanLimit = 1
+		}
 		anyHealthyPlayback := false
 		playbackRegistry.Range(func(_, v interface{}) bool {
 			if ps, ok := v.(*PlaybackState); ok && ps.IsHealthy {
