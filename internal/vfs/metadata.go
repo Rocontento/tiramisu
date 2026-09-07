@@ -11,20 +11,30 @@ import (
 	"time"
 )
 
+// FallbackCandidate is an alternate release to Wake() at play time if the
+// primary torrent doesn't answer within its timeout.
+type FallbackCandidate struct {
+	Hash  string `json:"hash"`
+	Index int    `json:"index"`
+	Size  int64  `json:"size"`
+}
+
 // Metadata is the in-memory representation used by the cache layer.
 type Metadata struct {
 	URL, Path, ImdbID string
 	Size              int64
 	Mtime             time.Time
+	Fallbacks         []FallbackCandidate
 }
 
 // FileMetadata represents metadata extracted from a virtual .mkv file
 type FileMetadata struct {
-	URL    string    // Stream URL from line 1
-	Size   int64     // File size in bytes from line 2
-	Mtime  time.Time // File modification time
-	Path   string    // Original file path
-	ImdbID string    // IMDB ID from line 4 (optional)
+	URL       string    // Stream URL from line 1
+	Size      int64     // File size in bytes from line 2
+	Mtime     time.Time // File modification time
+	Path      string    // Original file path
+	ImdbID    string    // IMDB ID from line 4 (optional)
+	Fallbacks []FallbackCandidate
 }
 
 // Validation constants
@@ -44,10 +54,11 @@ var (
 
 // MkvJSON is the internal JSON representation of a .mkv file.
 type MkvJSON struct {
-	URL    string `json:"url"`
-	Size   int64  `json:"size"`
-	Magnet string `json:"magnet"`
-	Imdb   string `json:"imdb"`
+	URL       string              `json:"url"`
+	Size      int64               `json:"size"`
+	Magnet    string              `json:"magnet"`
+	Imdb      string              `json:"imdb"`
+	Fallbacks []FallbackCandidate `json:"fallbacks,omitempty"`
 }
 
 // ReadMetadataFromFile reads metadata from a virtual .mkv file.
@@ -99,11 +110,12 @@ func parseJSONFormat(content string, info os.FileInfo, path string) (*FileMetada
 	}
 
 	return &FileMetadata{
-		URL:    url,
-		Size:   j.Size,
-		Mtime:  info.ModTime(),
-		Path:   path,
-		ImdbID: imdbID,
+		URL:       url,
+		Size:      j.Size,
+		Mtime:     info.ModTime(),
+		Path:      path,
+		ImdbID:    imdbID,
+		Fallbacks: j.Fallbacks,
 	}, nil
 }
 

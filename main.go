@@ -322,6 +322,30 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 	return "", 0, fmt.Errorf("file not found in torrent")
 }
 
+// promoteFallbackCandidate rewrites a stub's on-disk JSON so a working fallback
+// becomes the primary release, dropping it from the fallback list. Called after
+// the original primary failed to Wake at play time, so the next open (and a
+// restart) goes straight to the release that's actually alive.
+func promoteFallbackCandidate(path, imdbID string, working vfs.FallbackCandidate, remaining []vfs.FallbackCandidate) {
+	data := map[string]interface{}{
+		"url":    fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, working.Hash, working.Index),
+		"size":   working.Size,
+		"magnet": "magnet:?xt=urn:btih:" + working.Hash,
+		"imdb":   imdbID,
+	}
+	if len(remaining) > 0 {
+		data["fallbacks"] = remaining
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, jsonData, 0644) == nil {
+		os.Rename(tmp, path)
+	}
+}
+
 // Fast deterministic inode from FNV-1a hash to avoid syscalls in Readdir.
 // Uses POSIX bits (syscall.S_IFDIR/S_IFREG) for FUSE/Samba/kernel compatibility.
 func hashFilenameToInode(name string) uint64 {
@@ -872,10 +896,32 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	if nativeBridge != nil && magnetCandidate != "" {
 		if headReady {
 			safeGo(func() {
-				_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
+				_ = nativeBridge.Wake(magnetCandidate, urlFileIdx, 0)
 			})
 		} else {
-			_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
+			// Lazily-synced stubs carry alternate releases picked but never swarm-checked
+			// at sync time (see MovieSync). If the primary doesn't answer within a bounded
+			// window, try each fallback in turn and promote whichever works so future opens
+			// go straight to it instead of retrying a dead release.
+			primaryTimeout := 45 * time.Second
+			if len(n.vMeta.Fallbacks) > 0 {
+				primaryTimeout = 25 * time.Second
+			}
+			if err := nativeBridge.Wake(magnetCandidate, urlFileIdx, primaryTimeout); err != nil {
+				for i, fb := range n.vMeta.Fallbacks {
+					if fbErr := nativeBridge.Wake("magnet:?xt=urn:btih:"+fb.Hash, fb.Index, 25*time.Second); fbErr == nil {
+						remaining := append([]vfs.FallbackCandidate{}, n.vMeta.Fallbacks[i+1:]...)
+						logger.Printf("[Fallback] %s unresponsive, switched to alternate release %s", filepath.Base(n.vMeta.Path), fb.Hash)
+						hashStr, urlFileIdx = fb.Hash, fb.Index
+						magnetCandidate = "magnet:?xt=urn:btih:" + fb.Hash
+						n.vMeta.URL = fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, fb.Hash, fb.Index)
+						n.vMeta.Size = fb.Size
+						n.vMeta.Fallbacks = remaining
+						promoteFallbackCandidate(n.vMeta.Path, n.vMeta.ImdbID, fb, remaining)
+						break
+					}
+				}
+			}
 		}
 	}
 
@@ -2869,11 +2915,12 @@ func getOrReadMeta(path string) (*vfs.Metadata, error) {
 			}
 
 			m = &vfs.Metadata{
-				URL:    fileMeta.URL,
-				Size:   fileMeta.Size,
-				Mtime:  fileMeta.Mtime,
-				Path:   fileMeta.Path,
-				ImdbID: fileMeta.ImdbID,
+				URL:       fileMeta.URL,
+				Size:      fileMeta.Size,
+				Mtime:     fileMeta.Mtime,
+				Path:      fileMeta.Path,
+				ImdbID:    fileMeta.ImdbID,
+				Fallbacks: fileMeta.Fallbacks,
 			}
 
 			metaCache.Put(path, m, approximateMetadataSize(m))

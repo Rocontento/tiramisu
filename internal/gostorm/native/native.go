@@ -42,8 +42,12 @@ func NewNativeClient() *NativeClient {
 }
 
 // Wake triggers the start of a torrent (Ghost -> Active) entirely in-memory
-// Synchronous & Deduplicated.
-func (c *NativeClient) Wake(magnetUrl string, fileIdx int) error {
+// Synchronous & Deduplicated. metadataTimeout bounds the wait for the torrent's
+// metadata handshake; pass 0 for the default (45s).
+func (c *NativeClient) Wake(magnetUrl string, fileIdx int, metadataTimeout time.Duration) error {
+	if metadataTimeout <= 0 {
+		metadataTimeout = 45 * time.Second
+	}
 	// V239-Semaphore: Guard against "Thread Exhaustion" during massive scans
 	select {
 	case c.wakeSemaphore <- struct{}{}:
@@ -87,8 +91,8 @@ func (c *NativeClient) Wake(magnetUrl string, fileIdx int) error {
 	// Wait for metadata
 	if t != nil {
 		if t.Torrent != nil && t.Torrent.Info() == nil {
-			// Metadata NOT ready yet - wait with 45s timeout (Resilience)
-			timer := time.NewTimer(45 * time.Second)
+			// Metadata NOT ready yet - wait with bounded timeout (Resilience)
+			timer := time.NewTimer(metadataTimeout)
 			defer timer.Stop()
 
 			select {
@@ -96,7 +100,7 @@ func (c *NativeClient) Wake(magnetUrl string, fileIdx int) error {
 				// Metadata ready — fall through to log below
 			case <-timer.C:
 				log.Printf("[NativeBridge] Metadata timeout for %s", hash)
-				return fmt.Errorf("torrent metadata timeout (45s): %s", hash)
+				return fmt.Errorf("torrent metadata timeout (%s): %s", metadataTimeout, hash)
 			}
 		}
 		pieceLenKB := 0

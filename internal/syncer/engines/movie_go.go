@@ -106,16 +106,14 @@ type MovieEngineConfig struct {
 
 // Movie thresholds
 const (
-	mMovieUpgradePct     = 1.1
-	mMovieProcessSleep   = 1 * time.Second
-	mMovieMetadataWait   = 12
-	mMovie4KMetadataWait = 45
-	noMKVCacheTTL        = 12 * time.Hour
-	noStreamsCacheTTL    = 24 * time.Hour
-	recheckCacheTTL      = 48 * time.Hour
-	recheck1080pTTL      = 6 * time.Hour
-	recheckNoFileTTL     = 24 * time.Hour
-	addFailCacheTTL      = 168 * time.Hour
+	mMovieUpgradePct   = 1.1
+	mMovieProcessSleep = 1 * time.Second
+	noMKVCacheTTL      = 12 * time.Hour
+	noStreamsCacheTTL  = 24 * time.Hour
+	recheckCacheTTL    = 48 * time.Hour
+	recheck1080pTTL    = 6 * time.Hour
+	recheckNoFileTTL   = 24 * time.Hour
+	addFailCacheTTL    = 168 * time.Hour
 )
 
 var (
@@ -450,79 +448,81 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 	existingPath := existing.path
 	existingScore := existing.score
 
-	// Try candidates
+	// Lazy sync: pick the best candidate by indexer metadata alone, without touching the
+	// swarm. The winner (and a few runners-up, kept as fallbacks) get verified for real only
+	// at play time (see VirtualMkvNode.Open in main.go), when a 25-45s wait and an automatic
+	// fallback to the next candidate are cheap because exactly one file is being opened —
+	// instead of expensive here, where dozens of movies get AddTorrent+GetTorrentInfo per run.
+	var usable []MovieStream
 	for _, c := range candidates {
 		if existingPath != "" && float64(c.QualityScore) <= float64(existingScore)*mMovieUpgradePct {
 			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_better_stream", TS: time.Now().Unix()})
 			return false
 		}
-
 		if e.isInCache(e.noMKVCache, c.Hash, noMKVCacheTTL) {
 			continue
 		}
-
 		if diskHashes[c.Hash[len(c.Hash)-8:]] {
 			continue
 		}
-
-		magnet := BuildMagnet(c.Hash, title, DefaultTrackers())
-		hash, err := e.gostorm.AddTorrent(ctx, magnet, title)
-		if err != nil || hash == "" {
-			e.setCache(e.addFailCache, imdbID, CacheEntry{Title: title, Reason: "add_failed", TS: time.Now().Unix()})
-			continue
+		usable = append(usable, c)
+		if len(usable) > mMovieMaxFallbacks {
+			break
 		}
-		delete(e.addFailCache, imdbID)
+	}
+	if len(usable) == 0 {
+		e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_better_stream", TS: time.Now().Unix()})
+		return false
+	}
 
-		maxWait := mMovieMetadataWait
-		if c.Is4K {
-			maxWait = mMovie4KMetadataWait
-		}
-
-		info, err := e.gostorm.GetTorrentInfo(ctx, hash, maxWait)
-		if err != nil {
-			e.setCache(e.noMKVCache, hash, CacheEntry{Reason: "metadata_timeout", TS: time.Now().Unix()})
-			e.gostorm.RemoveTorrent(ctx, hash)
-			continue
-		}
-
-		videoFiles := e.filterVideoFiles(info.FileStats, c.Is4K)
-		if len(videoFiles) == 0 {
-			e.setCache(e.noMKVCache, hash, CacheEntry{Reason: "no_valid_files", TS: time.Now().Unix()})
-			e.gostorm.RemoveTorrent(ctx, hash)
-			continue
-		}
-
-		// Take largest
-		sort.Slice(videoFiles, func(i, j int) bool {
-			return videoFiles[i].Length > videoFiles[j].Length
+	primary := usable[0]
+	fallbacks := make([]map[string]interface{}, 0, len(usable)-1)
+	for _, c := range usable[1:] {
+		fallbacks = append(fallbacks, map[string]interface{}{
+			"hash": c.Hash, "index": 0, "size": estimateFileSize(c),
 		})
-		bestFile := videoFiles[0]
+	}
 
-		// Remove existing if upgrading
-		if existingPath != "" {
-			e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
-			e.removeStub(ctx, existingPath, existing.hash)
+	if existingPath != "" {
+		e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
+		e.removeStub(ctx, existingPath, existing.hash)
+	}
+
+	magnet := BuildMagnet(primary.Hash, title, DefaultTrackers())
+	filename := e.buildMovieFilename(title, movie.ReleaseDate, primary)
+	mkvPath := filepath.Join(e.moviesDir, filename)
+	fileSize := estimateFileSize(primary)
+	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, primary.Hash, 0)
+
+	if e.createMKV(mkvPath, streamURL, fileSize, magnet, imdbID, fallbacks) {
+		res := "4K"
+		if !primary.Is4K {
+			res = "1080p"
 		}
-
-		filename := e.buildMovieFilename(title, movie.ReleaseDate, c)
-		mkvPath := filepath.Join(e.moviesDir, filename)
-		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
-
-		if e.createMKV(mkvPath, streamURL, bestFile.Length, magnet, imdbID) {
-			res := "4K"
-			if !c.Is4K {
-				res = "1080p"
-			}
-			e.logger.Printf("[MovieSync] Created: %s (%s, %.1fGB, score:%d)", filename, res, float64(bestFile.Length)/1024/1024/1024, c.QualityScore)
-			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "processed", TS: time.Now().Unix()})
-			return true
-		}
-
-		e.gostorm.RemoveTorrent(ctx, hash)
+		e.logger.Printf("[MovieSync] Created (lazy): %s (%s, ~%.1fGB, score:%d, %d fallback(s))",
+			filename, res, float64(fileSize)/1024/1024/1024, primary.QualityScore, len(fallbacks))
+		e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "processed", TS: time.Now().Unix()})
+		return true
 	}
 
 	e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_better_stream", TS: time.Now().Unix()})
 	return false
+}
+
+// mMovieMaxFallbacks caps how many runner-up candidates ride along as fallbacks.
+const mMovieMaxFallbacks = 3
+
+// estimateFileSize converts the indexer-reported size to bytes, falling back to a
+// plausible default when the indexer didn't report one (allowed for 4K, see
+// classifyMovieStream) — real size is unknown until play-time verification anyway.
+func estimateFileSize(c MovieStream) int64 {
+	if c.SizeGB > 0 {
+		return int64(c.SizeGB * 1024 * 1024 * 1024)
+	}
+	if c.Is4K {
+		return 15 * 1024 * 1024 * 1024
+	}
+	return 4 * 1024 * 1024 * 1024
 }
 
 type MovieStream struct {
@@ -745,26 +745,6 @@ func (e *MovieGoEngine) extractMovieSeeders(title string) int {
 	return 0
 }
 
-func (e *MovieGoEngine) filterVideoFiles(files []FileStat, is4K bool) []FileStat {
-	var valid []FileStat
-	for _, f := range files {
-		ext := strings.ToLower(filepath.Ext(f.Path))
-		if ext != ".mkv" && ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".m4v" {
-			continue
-		}
-		minSize := int64(e.weights.Min4KGB) * 1024 * 1024 * 1024
-		maxSize := int64(e.weights.Max4KGB) * 1024 * 1024 * 1024
-		if !is4K {
-			minSize = int64(e.weights.Min1080pGB) * 1024 * 1024 * 1024
-			maxSize = int64(e.weights.Max1080pGB) * 1024 * 1024 * 1024
-		}
-		if f.Length >= minSize && f.Length <= maxSize {
-			valid = append(valid, f)
-		}
-	}
-	return valid
-}
-
 func (e *MovieGoEngine) buildMovieFilename(title, releaseDate string, stream MovieStream) string {
 	year := ""
 	if len(releaseDate) >= 4 {
@@ -867,6 +847,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 
 		var url, magnet, imdbID string
 		var size float64
+		var fallbacks interface{}
 		content := strings.TrimSpace(string(data))
 
 		if strings.HasPrefix(content, "{") {
@@ -878,6 +859,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			magnet, _ = obj["magnet"].(string)
 			size, _ = obj["size"].(float64)
 			imdbID, _ = obj["imdb"].(string)
+			fallbacks = obj["fallbacks"]
 		} else {
 			lines := strings.SplitN(content, "\n", 4)
 			if len(lines) < 3 {
@@ -911,7 +893,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 				// wiped dedup metadata on every rehydration and let buildExistingMovieIndex's
 				// imdb=="" skip make the file invisible to future dedup checks (root cause of
 				// duplicate movie files after a torrent expired and got rehydrated).
-				e.createMKV(path, url, int64(size), freshMagnet, imdbID)
+				e.createMKV(path, url, int64(size), freshMagnet, imdbID, fallbacks)
 			}
 		}
 
@@ -1079,12 +1061,18 @@ func (e *MovieGoEngine) saveIMDBCache(file string, data map[string]IMDBCacheEntr
 	os.Rename(tmp, file)
 }
 
-func (e *MovieGoEngine) createMKV(path, streamURL string, fileSize int64, magnet, imdbID string) bool {
+// fallbacks is nil/empty, or a []map[string]interface{} of {hash,index,size} — kept
+// generic so rehydrateMissingTorrents can pass an existing stub's fallbacks straight
+// through without re-typing them.
+func (e *MovieGoEngine) createMKV(path, streamURL string, fileSize int64, magnet, imdbID string, fallbacks interface{}) bool {
 	data := map[string]interface{}{
 		"url":    streamURL,
 		"size":   fileSize,
 		"magnet": magnet,
 		"imdb":   imdbID,
+	}
+	if fallbacks != nil {
+		data["fallbacks"] = fallbacks
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
