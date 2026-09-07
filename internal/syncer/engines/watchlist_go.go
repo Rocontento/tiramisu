@@ -145,64 +145,44 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 			continue
 		}
 
-		mkvCreated := false
+		// Lazy: no AddTorrent/GetTorrentInfo here. Pick the best-scored candidate from
+		// indexer metadata alone and store runners-up as fallbacks; the swarm gets
+		// touched for real only at play time (VirtualMkvNode.Open in main.go), same as
+		// MovieSync. This also means BDMV detection (needs the torrent's file list) no
+		// longer happens at sync time — a disc-image release picked as primary won't be
+		// caught until someone tries to play it, when it'll just look like a dead
+		// candidate and fall through to the next one.
+		var usable []prowlarr.Stream
 		for _, candidate := range candidates {
-			infoHash := strings.ToLower(candidate.InfoHash)
-			if infoHash == "" {
+			if strings.ToLower(candidate.InfoHash) == "" {
 				continue
 			}
-
-			magnet := BuildMagnet(infoHash, item.Title, DefaultTrackers())
-			hash, err := e.gostorm.AddTorrent(ctx, magnet, item.Title)
-			if err != nil || hash == "" {
-				continue
+			usable = append(usable, candidate)
+			if len(usable) > mMovieMaxFallbacks {
+				break
 			}
-
-			torrentInfo, err := e.gostorm.GetTorrentInfo(ctx, hash, 25)
-			if err != nil {
-				e.gostorm.RemoveTorrent(ctx, hash)
-				continue
-			}
-
-			isBDMV := false
-			for _, f := range torrentInfo.FileStats {
-				if strings.Contains(strings.ToUpper(f.Path), "BDMV") {
-					isBDMV = true
-					break
-				}
-			}
-			if isBDMV {
-				e.gostorm.RemoveTorrent(ctx, hash)
-				continue
-			}
-
-			var bestFile *FileStat
-			for i := range torrentInfo.FileStats {
-				f := &torrentInfo.FileStats[i]
-				if strings.HasSuffix(strings.ToLower(f.Path), ".mkv") {
-					if bestFile == nil || f.Length > bestFile.Length {
-						bestFile = f
-					}
-				}
-			}
-			if bestFile == nil {
-				e.gostorm.RemoveTorrent(ctx, hash)
-				continue
-			}
-
-			mkvPath, err := e.createMKV(hash, candidate.Title, bestFile.ID, bestFile.Length, magnet, item.IMDBID, item.Title, item.Year)
-			if err != nil || mkvPath == "" {
-				continue
-			}
-
-			added++
-			mkvCreated = true
-			break
 		}
-
-		if !mkvCreated {
+		if len(usable) == 0 {
 			skipped++
+			continue
 		}
+
+		primary := usable[0]
+		primaryHash := strings.ToLower(primary.InfoHash)
+		fallbacks := make([]map[string]interface{}, 0, len(usable)-1)
+		for _, c := range usable[1:] {
+			fallbacks = append(fallbacks, map[string]interface{}{
+				"hash": strings.ToLower(c.InfoHash), "index": 0, "size": watchlistEstimateSize(c),
+			})
+		}
+
+		magnet := BuildMagnet(primaryHash, item.Title, DefaultTrackers())
+		mkvPath, err := e.createMKV(primaryHash, primary.Title, 0, watchlistEstimateSize(primary), magnet, item.IMDBID, item.Title, item.Year, fallbacks)
+		if err != nil || mkvPath == "" {
+			skipped++
+			continue
+		}
+		added++
 
 		if err := e.limiter.Wait(ctx); err != nil {
 			return ctx.Err()
@@ -491,7 +471,20 @@ func (e *WatchlistGoEngine) pickBestStream(streams []prowlarr.Stream) []prowlarr
 	return result
 }
 
-func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, fileSize int64, magnet, imdbID, movieTitle, year string) (string, error) {
+// watchlistEstimateSize mirrors estimateFileSize in movie_go.go: the indexer's
+// title-embedded size when present, else a plausible default by resolution —
+// real size is unknown until play-time verification anyway.
+func watchlistEstimateSize(c prowlarr.Stream) int64 {
+	if gb := extractGB(c.Title); gb > 0 {
+		return int64(gb * 1024 * 1024 * 1024)
+	}
+	if re4K.MatchString(c.Title) {
+		return 15 * 1024 * 1024 * 1024
+	}
+	return 4 * 1024 * 1024 * 1024
+}
+
+func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, fileSize int64, magnet, imdbID, movieTitle, year string, fallbacks interface{}) (string, error) {
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, fileIndex)
 
 	qtag := ""
@@ -519,6 +512,9 @@ func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, f
 		"size":   fileSize,
 		"magnet": magnet,
 		"imdb":   imdbID,
+	}
+	if fallbacks != nil {
+		data["fallbacks"] = fallbacks
 	}
 
 	jsonData, err := json.Marshal(data)
