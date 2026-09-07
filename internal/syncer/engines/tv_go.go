@@ -256,8 +256,12 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	// processedThisRun and stats are long-lived struct fields, not local vars.
 	e.processedThisRun = make(map[string]bool)
 	e.stats = TVSyncStats{}
-	e.populateRegistryFromExisting()
+	// Reconcile first, then adopt. The other order loses files: populate skips a path whose
+	// episode key is already registered - even when that entry points at a different, now
+	// deleted file - and reconcile then drops the stale entry, leaving the real file on disk
+	// registered nowhere. cleanupOrphanedFiles deletes exactly that at the end of the run.
 	e.reconcileRegistry()
+	e.populateRegistryFromExisting()
 
 	shows, err := e.discoverShows(ctx)
 	if err != nil {
@@ -1330,6 +1334,15 @@ func (e *TVGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 	regPaths := make(map[string]bool)
 	for _, entry := range e.registry {
 		regPaths[entry.FilePath] = true
+	}
+
+	// An empty registry is never a reason to delete a library. It means the DB load failed or
+	// populateRegistryFromExisting matched nothing, not that every episode on disk is an
+	// orphan - and treating it as one is what wiped the movie library (see
+	// MovieGoEngine.cleanupOrphanedFiles). With no registry there is no signal to act on.
+	if len(regPaths) == 0 {
+		e.logger.Printf("[TVSync] Registry is empty — skipping orphan cleanup rather than treating every file as an orphan")
+		return
 	}
 
 	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
