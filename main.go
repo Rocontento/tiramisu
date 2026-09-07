@@ -243,6 +243,60 @@ type NativePumpState struct {
 	interruptPending atomic.Bool // prevents cascade: only the first handle per seek fires Interrupt()
 }
 
+// videoFileExts are the container extensions a stub's target file can carry. A torrent
+// routinely bundles a sample, an NFO and subtitles alongside the payload, so "the video"
+// has to be picked out rather than assumed to be first.
+var videoFileExts = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".mov": true, ".m4v": true,
+	".ts": true, ".m2ts": true, ".mpg": true, ".mpeg": true, ".wmv": true,
+}
+
+// largestPlayableIndex returns the position of the largest video file in files, or of the
+// largest file of any kind when none carries a known video extension (disc images, exotic
+// containers). Returns -1 for an empty list. The result is a 0-based position in the
+// caller's already-sorted slice; GoStorm file ids are that position plus one.
+func largestPlayableIndex(files []*torrent.File) int {
+	bestIdx, bestSize := -1, int64(-1)
+	fallbackIdx, fallbackSize := -1, int64(-1)
+	for i, f := range files {
+		if f.Length() > fallbackSize {
+			fallbackSize = f.Length()
+			fallbackIdx = i
+		}
+		if !videoFileExts[strings.ToLower(filepath.Ext(f.Path()))] {
+			continue
+		}
+		if f.Length() > bestSize {
+			bestSize = f.Length()
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 {
+		return bestIdx
+	}
+	return fallbackIdx
+}
+
+// urlFileIndex reads the index= query parameter out of a stream URL. GoStorm file ids are
+// 1-based ("in web id 0 is undefined", torr/torrent.go), so anything below 1 means the
+// stub does not know its file yet - which is what lazy sync writes for every stub it
+// creates without touching the swarm.
+func urlFileIndex(url string) int {
+	if !strings.Contains(url, "index=") {
+		return 0
+	}
+	iStart := strings.Index(url, "index=") + 6
+	iEnd := strings.Index(url[iStart:], "&")
+	if iEnd == -1 {
+		iEnd = len(url) - iStart
+	}
+	idx, err := strconv.Atoi(url[iStart : iStart+iEnd])
+	if err != nil {
+		return 0
+	}
+	return idx
+}
+
 // resolveTargetFile finds the torrent hash and file index for a given URL and size.
 func resolveTargetFile(url string, targetSize int64, physicalPath string) (string, int, error) {
 	if nativeBridge == nil {
@@ -256,6 +310,7 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 		}
 		hashStr := url[start : start+end]
 		hash := metainfo.NewHashFromHex(hashStr)
+		urlFileIdx := urlFileIndex(url)
 
 		t := web.BTS.GetTorrent(hash)
 
@@ -303,45 +358,37 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 				return hashStr, sizeMatchIndex, nil
 			}
 
-			// No exact size match at all: targetSize is a lazy-sync estimate (indexer-
-			// reported or a flat default), not the torrent's real file size, so it was
-			// never going to match byte-for-byte. Fall back to the largest actual video
-			// file in the torrent — the same heuristic eager sync used to pick a file
-			// before this stub existed. Beats trusting url's index=0 default blind,
-			// which fails outright on any torrent whose video isn't its first file
-			// (sample.mkv, NFO, subs bundled alongside it).
-			if matchesBySize == 0 {
-				bestIdx, bestSize := -1, int64(-1)
-				for i, f := range files {
-					ext := strings.ToLower(filepath.Ext(f.Path()))
-					if ext != ".mkv" && ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".m4v" {
-						continue
-					}
-					if f.Length() > bestSize {
-						bestSize = f.Length()
-						bestIdx = i
-					}
-				}
-				if bestIdx >= 0 {
-					return hashStr, bestIdx + 1, nil
+			// No single size match: targetSize is a lazy-sync estimate (indexer-reported
+			// or a flat default), not the torrent's real file size, so it was never going
+			// to match byte-for-byte and matchesBySize is 0 for every lazily-created stub.
+			// Fall back to the largest actual video file in the torrent — the same
+			// heuristic eager sync used to pick a file before this stub existed. Beats
+			// trusting url's index=0 default blind, which fails outright on any torrent
+			// whose video isn't its first file (sample.mkv, NFO, subs bundled alongside).
+			// Only overrides a usable url index when nothing matched by size at all: on an
+			// eager stub the recorded index was read off this same torrent at sync time and
+			// stays authoritative when two files happen to share the recorded size.
+			if matchesBySize == 0 || urlFileIdx < 1 {
+				if idx := largestPlayableIndex(files); idx >= 0 {
+					return hashStr, idx + 1, nil
 				}
 			}
 		}
 
-		// Fallback: extract index from URL if torrent not in RAM or name match failed.
-		// Wake() will perform full discovery later.
-		urlFileIdx := 0
-		if strings.Contains(url, "index=") {
-			iStart := strings.Index(url, "index=") + 6
-			iEnd := strings.Index(url[iStart:], "&")
-			if iEnd == -1 {
-				iEnd = len(url) - iStart
-			}
-			if idx, err := strconv.Atoi(url[iStart : iStart+iEnd]); err == nil {
-				urlFileIdx = idx
-			}
+		// Fallback: the index the URL carries, for when the torrent isn't in RAM or nothing
+		// in it matched. Wake() will perform full discovery later.
+		if urlFileIdx >= 1 {
+			return hashStr, urlFileIdx, nil
 		}
-		return hashStr, urlFileIdx, nil
+
+		// index=0 is what lazy sync writes for a stub whose file it never looked at, and
+		// GoStorm file ids are 1-based ("in web id 0 is undefined", torr/torrent.go).
+		// Returning it as if resolved pins the handle to an id Stream() rejects outright
+		// ("file with id 0 not found") for the life of that handle — playback resolves
+		// metadata fine and then spins forever. Report it unresolved instead: the caller
+		// falls back to the cache/retry path and re-resolves once the torrent's file list
+		// is actually in RAM.
+		return "", 0, fmt.Errorf("file index unknown for %s: torrent not in RAM yet", hashStr)
 	}
 	return "", 0, fmt.Errorf("file not found in torrent")
 }
@@ -368,6 +415,106 @@ func promoteFallbackCandidate(path, imdbID string, working vfs.FallbackCandidate
 	if os.WriteFile(tmp, jsonData, 0644) == nil {
 		os.Rename(tmp, path)
 	}
+}
+
+// shortHash truncates an infohash for logging. The hashes reaching the FUSE layer come from
+// stub files written by sync, which is remote indexer data one step removed: a malformed one
+// slicing [:8] would panic on a goroutine serving a read, and there is no recover on that
+// path — the process dies over a log line.
+func shortHash(h string) string {
+	if len(h) <= 8 {
+		return h
+	}
+	return h[:8]
+}
+
+// replaceURLIndex rewrites the index= parameter of a stream URL, appending one when the URL
+// carries none. Returns "" for an empty URL.
+func replaceURLIndex(url string, idx int) string {
+	if url == "" {
+		return ""
+	}
+	if !strings.Contains(url, "index=") {
+		sep := "&"
+		if !strings.Contains(url, "?") {
+			sep = "?"
+		}
+		return fmt.Sprintf("%s%sindex=%d", url, sep, idx)
+	}
+	// start is the offset just past "index=", so url[:start] already carries the key.
+	start := strings.Index(url, "index=") + 6
+	end := strings.Index(url[start:], "&")
+	if end == -1 {
+		return fmt.Sprintf("%s%d", url[:start], idx)
+	}
+	return fmt.Sprintf("%s%d%s", url[:start], idx, url[start+end:])
+}
+
+// persistResolvedIndex rewrites a stub's stream URL with the file index actually resolved
+// from the torrent, and reports the new URL. Lazy sync writes index=0 because it never opens
+// the torrent; leaving it there makes every later open re-run the resolve heuristic and, since
+// warmup files are keyed by (hash, fileID), warm a key no read will ever look under. Only the
+// url field is touched, so size/magnet/imdb/fallbacks survive, and the stub's mtime is put back
+// so the rewrite doesn't read as a content change to a watching media server. A legacy
+// line-format stub is left alone.
+func persistResolvedIndex(path string, fileIdx int) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return "", false
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return "", false
+	}
+	oldURL, _ := obj["url"].(string)
+	newURL := replaceURLIndex(oldURL, fileIdx)
+	if newURL == "" || newURL == oldURL {
+		return "", false
+	}
+	obj["url"] = newURL
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return "", false
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return "", false
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return "", false
+	}
+	os.Chtimes(path, time.Now(), info.ModTime())
+	logger.Printf("[LazyStub] Resolved file index %d for %s, written back", fileIdx, filepath.Base(path))
+	return newURL, true
+}
+
+// refreshCachedMeta replaces the metaCache entry for a path. The *vfs.Metadata a node holds
+// is the shared cache entry, read concurrently by Getattr and Readdir, so writing through it
+// is a data race - and the stale copy would outlive this Open anyway. Replacing the entry
+// leaves existing readers on the old immutable struct and points every later lookup at the
+// new one.
+func refreshCachedMeta(old *vfs.Metadata, url string, size int64, fallbacks []vfs.FallbackCandidate) {
+	if old == nil || metaCache == nil {
+		return
+	}
+	fresh := &vfs.Metadata{
+		URL:       url,
+		Path:      old.Path,
+		ImdbID:    old.ImdbID,
+		Size:      size,
+		Mtime:     old.Mtime,
+		Fallbacks: fallbacks,
+	}
+	metaCache.Put(fresh.Path, fresh, approximateMetadataSize(fresh))
 }
 
 // Fast deterministic inode from FNV-1a hash to avoid syscalls in Readdir.
@@ -899,20 +1046,30 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		oldTimer.(*time.Timer).Stop()
 	}
 
-	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(n.vMeta.URL)
+	// n.vMeta is the entry metaCache hands out, shared by every node and read concurrently
+	// by Getattr/Readdir. The fallback switch below must not write through it: the effective
+	// release for this Open lives in these locals, and a promotion replaces the cache entry
+	// wholesale instead of mutating the struct under other readers.
+	effURL, effSize, effFallbacks := n.vMeta.URL, n.vMeta.Size, n.vMeta.Fallbacks
+
+	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(effURL)
 
 	// hasFullWarmup: Open returns instantly only if both head and tail warmup files are ready.
 	// headReady: Allows async Wake and direct ID injection for instant start.
+	// Warmup files are keyed by (hash, fileID), and the id written there is the resolved,
+	// 1-based one. A lazy stub's index=0 is not a file id at all, so probing with it looks up
+	// a key nothing ever writes: it would report a permanent cache miss and, worse, the
+	// headReady shortcut below would inject 0 as the handle's fileID.
 	headReady := false
 	tailReady := false
-	if warmup.DiskWarmup != nil && hashStr != "" {
+	if warmup.DiskWarmup != nil && hashStr != "" && urlFileIdx >= 1 {
 		headReady = warmup.DiskWarmup.GetAvailableRange(hashStr, urlFileIdx) > 0
 		tailReady = warmup.DiskWarmup.TailReady(hashStr, urlFileIdx)
 	}
-	ttffRegister(n.vMeta.Path, n.vMeta.Size, hashStr, headReady, tailReady)
+	ttffRegister(n.vMeta.Path, effSize, hashStr, headReady, tailReady)
 
-	magnetCandidate := n.vMeta.URL
-	if hashStr != "" && (strings.HasPrefix(n.vMeta.URL, "http://") || strings.HasPrefix(n.vMeta.URL, "https://")) {
+	magnetCandidate := effURL
+	if hashStr != "" && (strings.HasPrefix(effURL, "http://") || strings.HasPrefix(effURL, "https://")) {
 		magnetCandidate = "magnet:?xt=urn:btih:" + hashStr
 	}
 
@@ -928,20 +1085,21 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			// window, try each fallback in turn and promote whichever works so future opens
 			// go straight to it instead of retrying a dead release.
 			primaryTimeout := 45 * time.Second
-			if len(n.vMeta.Fallbacks) > 0 {
+			if len(effFallbacks) > 0 {
 				primaryTimeout = 25 * time.Second
 			}
 			if err := nativeBridge.Wake(magnetCandidate, urlFileIdx, primaryTimeout); err != nil {
-				for i, fb := range n.vMeta.Fallbacks {
+				for i, fb := range effFallbacks {
 					if fbErr := nativeBridge.Wake("magnet:?xt=urn:btih:"+fb.Hash, fb.Index, 25*time.Second); fbErr == nil {
-						remaining := append([]vfs.FallbackCandidate{}, n.vMeta.Fallbacks[i+1:]...)
+						remaining := append([]vfs.FallbackCandidate{}, effFallbacks[i+1:]...)
 						logger.Printf("[Fallback] %s unresponsive, switched to alternate release %s", filepath.Base(n.vMeta.Path), fb.Hash)
 						hashStr, urlFileIdx = fb.Hash, fb.Index
 						magnetCandidate = "magnet:?xt=urn:btih:" + fb.Hash
-						n.vMeta.URL = fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, fb.Hash, fb.Index)
-						n.vMeta.Size = fb.Size
-						n.vMeta.Fallbacks = remaining
+						effURL = fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, fb.Hash, fb.Index)
+						effSize = fb.Size
+						effFallbacks = remaining
 						promoteFallbackCandidate(n.vMeta.Path, n.vMeta.ImdbID, fb, remaining)
+						refreshCachedMeta(n.vMeta, effURL, effSize, remaining)
 						break
 					}
 				}
@@ -993,17 +1151,28 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		isNative = true
 	} else {
 		var err error
-		finalHash, fileIdx, err = resolveTargetFile(n.vMeta.URL, n.vMeta.Size, n.vMeta.Path)
+		finalHash, fileIdx, err = resolveTargetFile(effURL, effSize, n.vMeta.Path)
 		isNative = (err == nil)
 		if !isNative && gc().LogLevel == "DEBUG" {
 			logger.Printf("[NativeBridge] Resolution failed for %s: %v. Access will rely on cache/retry.", filepath.Base(n.vMeta.Path), err)
 		}
+		// A lazy stub carries index=0 because sync never opened the torrent. Now that the
+		// real id is known, write it back so the next open takes the headReady fast path
+		// and, more importantly, looks warmup up under the same (hash, fileID) key the
+		// writes use — otherwise every open of this title re-warms from scratch and the
+		// warmup files it leaves behind are never read again.
+		if isNative && urlFileIdx < 1 && fileIdx >= 1 {
+			if newURL, ok := persistResolvedIndex(n.vMeta.Path, fileIdx); ok {
+				effURL = newURL
+				refreshCachedMeta(n.vMeta, effURL, effSize, effFallbacks)
+			}
+		}
 	}
 
 	h := &MkvHandle{
-		url:              n.vMeta.URL,
+		url:              effURL,
 		magnet:           magnetCandidate, // Store for potential re-wake
-		size:             n.vMeta.Size,
+		size:             effSize,
 		path:             n.vMeta.Path,
 		lastTime:         now,
 		lastOff:          -1,
@@ -1016,7 +1185,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		h.hash = finalHash
 		h.fileID = fileIdx
 		// media.stop only knows the path; keep what EnsureTail needs to reach the file.
-		tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: n.vMeta.Size})
+		tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: effSize})
 		// Gillian: proactive pump start at Open() — pump ready before first Read().
 		// pumpOnce ensures single start; late rescue path in Read() handles hash=='' case.
 		h.pumpOnce.Do(func() {
@@ -1336,7 +1505,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
-			logger.Printf("[Pump] Late resolution success: %s", h.hash[:8])
+			logger.Printf("[Pump] Late resolution success: %s", shortHash(h.hash))
 		} else {
 			logger.Printf("[Pump] Warning: hash empty for %s, warmup disabled", filepath.Base(h.path))
 		}
@@ -2080,7 +2249,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
-			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), h.hash[:8])
+			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), shortHash(h.hash))
 			go h.pumpOnce.Do(func() {
 				h.startNativePump(h.hash, h.fileID)
 			})
@@ -2464,7 +2633,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 							hHash := metainfo.NewHashFromHex(h.hash)
 							if t := web.BTS.GetTorrent(hHash); t != nil {
 								t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
-								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", h.hash[:8])
+								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", shortHash(h.hash))
 							}
 
 							upgradedState := sharedState

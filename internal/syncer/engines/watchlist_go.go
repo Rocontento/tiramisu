@@ -154,7 +154,9 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 		// candidate and fall through to the next one.
 		var usable []prowlarr.Stream
 		for _, candidate := range candidates {
-			if strings.ToLower(candidate.InfoHash) == "" {
+			// Not just non-empty: createMKV builds the filename from hash[len-8:] and
+			// would panic on a malformed indexer hash, taking the whole run with it.
+			if !ValidInfoHash(candidate.InfoHash) {
 				continue
 			}
 			usable = append(usable, candidate)
@@ -476,7 +478,7 @@ func (e *WatchlistGoEngine) pickBestStream(streams []prowlarr.Stream) []prowlarr
 // real size is unknown until play-time verification anyway.
 func watchlistEstimateSize(c prowlarr.Stream) int64 {
 	if gb := extractGB(c.Title); gb > 0 {
-		return int64(gb * 1024 * 1024 * 1024)
+		return clampStubSize(int64(gb * 1024 * 1024 * 1024))
 	}
 	if re4K.MatchString(c.Title) {
 		return 15 * 1024 * 1024 * 1024

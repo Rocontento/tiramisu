@@ -279,7 +279,7 @@ func (cm *CleanupManager) runCleanup() {
 					if t := torr.PeekTorrent(ps.Hash); t != nil && t.Torrent != nil && t.IsPriority.Load() {
 						t.IsPriority.Store(false)
 						t.SetAggressiveMode(false, 0)
-						cm.logger.Printf("[V273] Force Priority OFF for zombie torrent: %s", ps.Hash[:8])
+						cm.logger.Printf("[V273] Force Priority OFF for zombie torrent: %s", shortHash(ps.Hash))
 					}
 				}
 				playbackRegistry.Delete(key)

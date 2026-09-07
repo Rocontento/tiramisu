@@ -173,6 +173,15 @@ func (r *NativeReader) SetPieceLen(n int64) { r.pieceLen.Store(n) }
 // ErrInterrupted is returned by ReadAt when the pipe was closed by Interrupt().
 var ErrInterrupted = fmt.Errorf("interrupted by seek")
 
+// shortHash truncates an infohash for logging. It is set from a stub file written by sync
+// from indexer data, and this runs on the streaming path where a panic has no recover.
+func shortHash(h string) string {
+	if len(h) <= 8 {
+		return h
+	}
+	return h[:8]
+}
+
 // Short reads reported as success. io.ReadFull returns ErrUnexpectedEOF when the stream ends
 // early — a stalled pipe closed by FetchBlock's 8s timeout, or a hiccup mid-stream — and every
 // site below maps that to (n, nil). The caller cannot tell a partial read from a complete one,
@@ -390,7 +399,7 @@ func (r *NativeReader) startStream(off int64) error {
 		defer pw.Close()
 		if err := t.Stream(r.fileID, req, resp); err != nil {
 			log.Printf("[NativeReader] Stream error at off=%dMB fileID=%d hash=%s: %v",
-				off/(1024*1024), r.fileID, r.hash[:8], err)
+				off/(1024*1024), r.fileID, shortHash(r.hash), err)
 		}
 	}()
 

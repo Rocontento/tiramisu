@@ -525,6 +525,14 @@ func firstEnv(keys ...string) string {
 }
 
 func (c *Config) finalize() {
+	// The master limit is the capacity of masterDataSemaphore (main.go). At 0 that channel
+	// is unbuffered, so the non-blocking send that claims a pump slot can never succeed and
+	// nothing ever streams — the same symptom as the negative scanLimit this pairs with.
+	// The panel enforces a minimum of 1; a hand-edited config.json does not.
+	if c.MasterConcurrencyLimit < 1 {
+		c.MasterConcurrencyLimit = 1
+	}
+
 	// Sync legacy fields with unified master limit
 	c.ConcurrencyLimit = c.MasterConcurrencyLimit
 	c.MaxConcurrentHTTP = c.MasterConcurrencyLimit

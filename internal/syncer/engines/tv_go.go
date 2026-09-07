@@ -914,6 +914,12 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 		return nil
 	}
 
+	// Rejected here rather than downstream: processSingle builds the episode filename from
+	// hash[:8] and would panic on a malformed one, taking the whole sync run with it.
+	if !ValidInfoHash(s.InfoHash) {
+		return nil
+	}
+
 	// Title blacklist check
 	if e.isBlacklisted(title) {
 		return nil
@@ -1186,7 +1192,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 // unknown until play-time verification anyway.
 func tvEstimateSize(s TVStream) int64 {
 	if s.SizeGB > 0 {
-		return int64(s.SizeGB * 1024 * 1024 * 1024)
+		return clampStubSize(int64(s.SizeGB * 1024 * 1024 * 1024))
 	}
 	if reTV4K.MatchString(s.Title) {
 		return 4 * 1024 * 1024 * 1024

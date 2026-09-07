@@ -220,6 +220,21 @@ func TitleFromFilename(filename string) string {
 	return strings.TrimSpace(s)
 }
 
+// reInfoHash40 matches the only infohash shape the rest of the pipeline can carry: 40
+// lowercase hex characters. Stub filenames end in hash[:8] or hash[len-8:], the stream URL
+// is matched with link=([a-f0-9]{40}), and TorrentRemover refuses anything that isn't
+// exactly 40 chars long.
+var reInfoHash40 = regexp.MustCompile(`^[a-f0-9]{40}$`)
+
+// ValidInfoHash reports whether h is a usable v1 infohash. Indexer results are raw remote
+// input: eager sync used to launder them through AddTorrent, which rejected a malformed one
+// with an error, but lazy sync writes the indexer's string straight into a filename and a
+// URL. A short one takes the whole sync run down on hash[:8] — recovered by the scheduler,
+// so it shows up as a job that silently stops partway rather than as a crash.
+func ValidInfoHash(h string) bool {
+	return reInfoHash40.MatchString(strings.ToLower(h))
+}
+
 // BuildMagnet creates a magnet URL from an info hash and optional trackers.
 func BuildMagnet(infoHash, name string, trackers []string) string {
 	magnet := fmt.Sprintf("magnet:?xt=urn:btih:%s", infoHash)
