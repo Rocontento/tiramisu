@@ -7,6 +7,7 @@ name: Docker Publish
 
 on:
   push:
+    branches: [ main ]
     tags: [ 'v*.*.*' ]
   workflow_dispatch:
 
@@ -17,51 +18,48 @@ permissions:
   id-token: write
 
 env:
-  # Registry settings
-  REGISTRY_DOCKERHUB: docker.io
+  # GHCR only: the upstream Docker Hub push (mrrobotogit/tiramisu) needed
+  # DOCKER_HUB_USERNAME/DOCKER_HUB_TOKEN secrets that only the upstream repo
+  # has, and both registry targets used to be hardcoded to "mrrobotogit" —
+  # meaning a fork's GITHUB_TOKEN, which only has push rights to packages
+  # under its own repository_owner, would get a 403 on both. GHCR's own
+  # GITHUB_TOKEN is free on any fork, so this now publishes under whichever
+  # account runs the workflow.
   REGISTRY_GHCR: ghcr.io
   IMAGE_NAME: tiramisu
-  
+
 jobs:
   publish:
     name: Build and Publish
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
           platforms: all
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY_DOCKERHUB }}
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-      
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY_GHCR }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY_DOCKERHUB }}/mrrobotogit/${{ env.IMAGE_NAME }}
-            ${{ env.REGISTRY_GHCR }}/mrrobotogit/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -83,22 +81,12 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}
           provenance: true
           sbom: true
-      
-      - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v4
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-          repository: mrrobotogit/tiramisu
-          readme-filepath: ./README.md
-          short-description: "Advanced BitTorrent-FUSE for real streaming to your private Plex/Jellyfin library. No Debrid."
 
       - name: Generate build summary
         run: |
-          echo "## 🐳 Docker Images Published" >> $GITHUB_STEP_SUMMARY
+          echo "## 🐳 Docker Image Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 Published to:" >> $GITHUB_STEP_SUMMARY
-          echo "- **Docker Hub:** \`docker pull mrrobotogit/tiramisu:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- **GitHub Container Registry:** \`docker pull ghcr.io/${{ github.repository_owner }}/tiramisu:latest\`" >> $GITHUB_STEP_SUMMARY
