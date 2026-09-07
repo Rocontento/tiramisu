@@ -705,6 +705,26 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	}
 
 	// Process singles
+	// Group by episode key first so processSingle can embed runner-up releases as
+	// play-time fallbacks — same lazy trade as MovieSync/WatchlistSync: pick the best
+	// candidate from indexer metadata alone, verify/fall back for real only when
+	// someone presses play (VirtualMkvNode.Open in main.go).
+	singleFallbacks := make(map[string][]TVStream)
+	for _, s := range streams {
+		if s.IsFullpack {
+			continue
+		}
+		m := reTVEpNum.FindStringSubmatch(s.Title)
+		if len(m) < 3 {
+			continue
+		}
+		ep, _ := strconv.Atoi(m[2])
+		key := e.episodeKey(showName, s.Season, ep)
+		if len(singleFallbacks[key]) < mMovieMaxFallbacks+1 {
+			singleFallbacks[key] = append(singleFallbacks[key], s)
+		}
+	}
+
 	singlesProcessed := 0
 	for _, stream := range streams {
 		if stream.IsFullpack {
@@ -720,7 +740,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 			continue
 		}
 
-		count := e.processSingle(ctx, showName, stream, show.FirstAirDate, knownTitles)
+		count := e.processSingle(ctx, showName, stream, show.FirstAirDate, singleFallbacks)
 		created += count
 		singlesProcessed++
 	}
@@ -1076,7 +1096,13 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		return 0
 	}
 
-	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 90)
+	// Fullpacks can't be made lazy like MovieSync/WatchlistSync/processSingle: exploding
+	// a season pack into one stub per episode requires the real file list (which file is
+	// S03E07, its size, its index) — there's nothing to guess. This still needs the
+	// swarm at sync time. Trimmed from 90s to 60s to cap the worst case a bit; the real
+	// protection against pile-ups is Master Concurrency plus this only ever running one
+	// pack at a time (TVSync has no fan-out).
+	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 60)
 	if err != nil {
 		e.gostorm.RemoveTorrent(ctx, hash)
 		return 0
@@ -1133,7 +1159,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
 
-		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
+		if e.createMKV(epPath, streamURL, vf.Length, magnet, nil) {
 			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 				e.removeStub(ctx, existing.FilePath, existing.Hash)
 				e.stats.Upgrades++
@@ -1155,7 +1181,26 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 	return created
 }
 
-func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream TVStream, firstAirDate string, knownTitles []string) int {
+// tvEstimateSize mirrors estimateFileSize in movie_go.go: the indexer-reported
+// size when known, else a plausible default by resolution — real size is
+// unknown until play-time verification anyway.
+func tvEstimateSize(s TVStream) int64 {
+	if s.SizeGB > 0 {
+		return int64(s.SizeGB * 1024 * 1024 * 1024)
+	}
+	if reTV4K.MatchString(s.Title) {
+		return 4 * 1024 * 1024 * 1024
+	}
+	return 1500 * 1024 * 1024
+}
+
+// processSingle is lazy like MovieSync/WatchlistSync: no AddTorrent/GetTorrentInfo,
+// no contentsBelongToShow check (needs the file list, which nothing here fetches
+// anymore). It picks the best-scored single-episode release from indexer metadata
+// alone and stores runner-up releases from fallbackPool as play-time fallbacks —
+// verification and any retry happen only when someone presses play (see
+// VirtualMkvNode.Open in main.go).
+func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream TVStream, firstAirDate string, fallbackPool map[string][]TVStream) int {
 	title := stream.Title
 	m := reTVEpNum.FindStringSubmatch(title)
 	if len(m) < 3 {
@@ -1179,52 +1224,40 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 		}
 	}
 
-	magnet := BuildMagnet(stream.Hash, title, DefaultTrackers())
-	hash, err := e.gostorm.AddTorrent(ctx, magnet, title)
-	if err != nil || hash == "" {
+	hash := strings.ToLower(stream.Hash)
+	if hash == "" {
 		return 0
 	}
+	magnet := BuildMagnet(hash, title, DefaultTrackers())
 
-	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 45)
-	if err != nil {
-		e.gostorm.RemoveTorrent(ctx, hash)
-		return 0
-	}
-
-	var bestFile *FileStat
-	for i := range info.FileStats {
-		f := &info.FileStats[i]
-		if e.isVideoFile(f.Path) && f.Length >= tvMinEpisodeSize {
-			if bestFile == nil || f.Length > bestFile.Length {
-				cp := *f
-				bestFile = &cp
-			}
+	var fallbacks []map[string]interface{}
+	for _, fb := range fallbackPool[key] {
+		if strings.EqualFold(fb.Hash, stream.Hash) {
+			continue
 		}
-	}
-	if bestFile == nil {
-		e.gostorm.RemoveTorrent(ctx, hash)
-		return 0
-	}
-
-	if !e.contentsBelongToShow([]FileStat{*bestFile}, knownTitles, showName, title) {
-		e.gostorm.RemoveTorrent(ctx, hash)
-		return 0
+		fallbacks = append(fallbacks, map[string]interface{}{
+			"hash": strings.ToLower(fb.Hash), "index": 0, "size": tvEstimateSize(fb),
+		})
+		if len(fallbacks) >= mMovieMaxFallbacks {
+			break
+		}
 	}
 
 	cleanShow := e.getShowFolderName(showName, firstAirDate)
 	seasonDir := filepath.Join(e.tvDir, cleanShow, fmt.Sprintf("Season.%02d", season))
 	epFilename := e.buildFilename(showName, season, episode, hash[:8])
 	epPath := filepath.Join(seasonDir, epFilename)
-	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
+	fileSize := tvEstimateSize(stream)
+	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, 0)
 
-	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
+	if e.createMKV(epPath, streamURL, fileSize, magnet, fallbacks) {
 		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 			e.removeStub(ctx, existing.FilePath, existing.Hash)
 			e.stats.Upgrades++
 		}
 		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single")
 		e.processedThisRun[key] = true
-		e.logger.Printf("Created: %s", epFilename)
+		e.logger.Printf("Created (lazy): %s", epFilename)
 		return 1
 	}
 
@@ -1384,7 +1417,7 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 			freshMagnet := BuildMagnet(hash, displayTitle, DefaultTrackers())
 			e.logger.Printf("Rehydrating #%d: %s...", rehydrated+1, info.Name())
 			if _, err := e.gostorm.AddTorrent(ctx, freshMagnet, displayTitle); err == nil {
-				e.createMKV(path, url, int64(size), freshMagnet)
+				e.createMKV(path, url, int64(size), freshMagnet, nil)
 				rehydrated++
 				activeHashes[hash] = true
 				time.Sleep(5 * time.Second)
@@ -1515,12 +1548,15 @@ func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 strin
 	return fmt.Sprintf("%s_S%02dE%02d_%s.mkv", cleanShow, season, episode, hash8)
 }
 
-func (e *TVGoEngine) createMKV(path, streamURL string, fileSize int64, magnet string) bool {
+func (e *TVGoEngine) createMKV(path, streamURL string, fileSize int64, magnet string, fallbacks interface{}) bool {
 	data := map[string]interface{}{
 		"url":    streamURL,
 		"size":   fileSize,
 		"magnet": magnet,
 		"imdb":   "",
+	}
+	if fallbacks != nil {
+		data["fallbacks"] = fallbacks
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {

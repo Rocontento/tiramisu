@@ -911,10 +911,25 @@ func (e *MovieGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 		activeHashes[t.Hash] = true
 	}
 
+	// GoStorm drops a torrent from its active list ~15s after the last read
+	// (TorrentDisconnectTimeout). Being absent from that list is the library's
+	// normal resting state now that sync is lazy — nobody is watching most titles
+	// most of the time — not evidence a title should be deleted. Using live
+	// connection state as the orphan signal wiped this library from 152 files to
+	// 0 in testing: a run where the active set came back empty (or thin) read as
+	// "everything is orphaned".
+	//
+	// ponytail: downgraded to log-only until this has a real signal to act on — a
+	// persistent per-title registry (like TVGoEngine.registry) checked against,
+	// not GoStorm's live connection list. Re-enable deletion only once that
+	// exists; until then, treat any accumulation of stale stubs as a manual
+	// cleanup, not an automatic one.
+	total, orphans := 0, 0
 	filepath.Walk(e.moviesDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !strings.HasSuffix(strings.ToLower(path), ".mkv") {
 			return nil
 		}
+		total++
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
@@ -941,10 +956,13 @@ func (e *MovieGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 			return nil
 		}
 		if !activeHashes[m[1]] {
-			e.removeStub(ctx, path, m[1])
+			orphans++
 		}
 		return nil
 	})
+	if orphans > 0 {
+		e.logger.Printf("[MovieSync] %d/%d library files inactive in GoStorm right now (normal for a lazy library) — not deleting", orphans, total)
+	}
 }
 
 // Cache helpers
