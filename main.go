@@ -302,6 +302,30 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 			if matchesBySize == 1 {
 				return hashStr, sizeMatchIndex, nil
 			}
+
+			// No exact size match at all: targetSize is a lazy-sync estimate (indexer-
+			// reported or a flat default), not the torrent's real file size, so it was
+			// never going to match byte-for-byte. Fall back to the largest actual video
+			// file in the torrent — the same heuristic eager sync used to pick a file
+			// before this stub existed. Beats trusting url's index=0 default blind,
+			// which fails outright on any torrent whose video isn't its first file
+			// (sample.mkv, NFO, subs bundled alongside it).
+			if matchesBySize == 0 {
+				bestIdx, bestSize := -1, int64(-1)
+				for i, f := range files {
+					ext := strings.ToLower(filepath.Ext(f.Path()))
+					if ext != ".mkv" && ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".m4v" {
+						continue
+					}
+					if f.Length() > bestSize {
+						bestSize = f.Length()
+						bestIdx = i
+					}
+				}
+				if bestIdx >= 0 {
+					return hashStr, bestIdx + 1, nil
+				}
+			}
 		}
 
 		// Fallback: extract index from URL if torrent not in RAM or name match failed.
