@@ -122,11 +122,13 @@ func (b *StartupCacheBuilder) processDirectory(dirPath string, recursive bool) {
 			if !recursive && path != dirPath {
 				return filepath.SkipDir
 			}
-			// V133: Register directory in inode map
-			// Compute relative path from source for consistent inode generation
-			relPath, _ := filepath.Rel(b.sourcePath, path)
-			if relPath != "." && relPath != "" {
-				getDirInodeFromMap("/" + relPath)
+			// V133: Register directory in inode map, keyed by the same full path every
+			// FUSE call site uses (Lookup, Readdir, Getattr). Keying it on "/"+relPath
+			// registered a different string than the one anything ever looks up, so the
+			// entries were dead weight and the first Readdir after a restart still had to
+			// generate and re-dirty the map.
+			if path != b.sourcePath {
+				getDirInodeFromMap(path)
 			}
 			return nil
 		}
@@ -176,14 +178,11 @@ func (b *StartupCacheBuilder) processFile(path string) {
 		return
 	}
 
-	// Convert to Metadata format
-	meta := &vfs.Metadata{
-		URL:    fileMeta.URL,
-		Size:   fileMeta.Size,
-		Mtime:  fileMeta.Mtime,
-		Path:   fileMeta.Path,
-		ImdbID: fileMeta.ImdbID,
-	}
+	// Convert to Metadata format. Built through ToMetadata rather than field by field: this
+	// copy used to omit Fallbacks, and because the startup pass pre-populates the whole
+	// library, every stub served from this cache reached VirtualMkvNode.Open with an empty
+	// fallback list - the play-time switch to an alternate release could never fire.
+	meta := fileMeta.ToMetadata()
 
 	// Calculate approximate size
 	size := approximateMetadataSize(meta)

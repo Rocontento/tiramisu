@@ -72,7 +72,78 @@ import (
 var logger = log.New(os.Stdout, "[GoProxy] ", log.LstdFlags)
 
 // masterDataSemaphore limits concurrent data operations (Native, HTTP, Prefetch).
+//
+// Allocated at dataSlotHeadroom, not at MasterConcurrencyLimit: a channel's capacity cannot
+// be changed after make(), so sizing it to the value read at startup froze the limit for the
+// process lifetime — a change made in the Control Panel (which reloads globalConfig live) did
+// nothing until a restart, while StrategicReserve immediately started comparing against the
+// new number. The live budget is enforced at acquire time by tryAcquireDataSlot instead.
 var masterDataSemaphore chan struct{}
+
+// dataSlotHeadroom is the channel capacity. It only has to exceed any limit a user can
+// plausibly configure; the real cap is applied per acquire.
+const dataSlotHeadroom = 512
+
+// tryAcquireDataSlot takes a concurrent-data slot without blocking, honouring the limit in
+// force right now. The check-then-send is not atomic, so a burst of racing callers can
+// overshoot by a few; this is a soft resource cap and StrategicReserve already gates on the
+// same len() the same way.
+func tryAcquireDataSlot() bool {
+	limit := gc().MasterConcurrencyLimit
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > dataSlotHeadroom {
+		limit = dataSlotHeadroom
+	}
+	if len(masterDataSemaphore) >= limit {
+		return false
+	}
+	select {
+	case masterDataSemaphore <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseDataSlot returns a slot taken by tryAcquireDataSlot. Safe to call when none is held.
+func releaseDataSlot() {
+	select {
+	case <-masterDataSemaphore:
+	default:
+	}
+}
+
+// dataSlotPollInterval is how often waitForDataSlot retries. The live limit is re-read per
+// attempt rather than parked on a channel receive, so a limit raised while a read waits is
+// picked up on the next tick.
+const dataSlotPollInterval = 10 * time.Millisecond
+
+// waitForDataSlot blocks until a data slot is free, the FUSE request is cancelled, or the
+// budget expires. Returns false plus the errno the caller should hand back.
+func waitForDataSlot(ctx context.Context, budget time.Duration, path string) (bool, syscall.Errno) {
+	if tryAcquireDataSlot() {
+		return true, 0
+	}
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	ticker := time.NewTicker(dataSlotPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, syscall.EINTR
+		case <-deadline.C:
+			logger.Printf("[MasterSemaphore] Timeout waiting for slot: %s", filepath.Base(path))
+			return false, syscall.ETIMEDOUT
+		case <-ticker.C:
+			if tryAcquireDataSlot() {
+				return true, 0
+			}
+		}
+	}
+}
 
 var startTime = time.Now()
 var metaCache *cache.LRUCache
@@ -159,6 +230,43 @@ func (ps *PlaybackState) GetStatus() bool {
 	return ps.IsHealthy
 }
 
+// The accessors below exist because every field they touch is written by the webhook handler
+// or by Open while the cleanup loop and the pump scan the registry. Reading them bare - which
+// several call sites did - races with those writers on a live struct.
+
+// LastSignOfLife returns the most recent evidence this path was in use: the last open, or the
+// last webhook confirmation, whichever is later.
+func (ps *PlaybackState) LastSignOfLife() time.Time {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if !ps.ConfirmedAt.IsZero() && ps.ConfirmedAt.After(ps.OpenedAt) {
+		return ps.ConfirmedAt
+	}
+	return ps.OpenedAt
+}
+
+// GetOpenedAt returns when this path was last opened.
+func (ps *PlaybackState) GetOpenedAt() time.Time {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.OpenedAt
+}
+
+// EverConfirmed reports whether any webhook has ever confirmed this path.
+func (ps *PlaybackState) EverConfirmed() bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return !ps.ConfirmedAt.IsZero()
+}
+
+// GetImdbID returns the cached IMDB id. The webhook handler fills it in on first match, so it
+// is mutable and must not be read bare.
+func (ps *PlaybackState) GetImdbID() string {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.ImdbID
+}
+
 var playbackRegistry sync.Map // path -> *PlaybackState
 
 // Global sync cache manager (FASE 4.13 - Sync Script Caches)
@@ -243,10 +351,67 @@ type NativePumpState struct {
 	interruptPending atomic.Bool // prevents cascade: only the first handle per seek fires Interrupt()
 }
 
-// resolveTargetFile finds the torrent hash and file index for a given URL and size.
-func resolveTargetFile(url string, targetSize int64, physicalPath string) (string, int, error) {
+// videoFileExts are the container extensions a stub's target file can carry. A torrent
+// routinely bundles a sample, an NFO and subtitles alongside the payload, so "the video"
+// has to be picked out rather than assumed to be first.
+var videoFileExts = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".mov": true, ".m4v": true,
+	".ts": true, ".m2ts": true, ".mpg": true, ".mpeg": true, ".wmv": true,
+}
+
+// largestPlayableIndex returns the position of the largest video file in files, or of the
+// largest file of any kind when none carries a known video extension (disc images, exotic
+// containers). Returns -1 for an empty list. The result is a 0-based position in the
+// caller's already-sorted slice; GoStorm file ids are that position plus one.
+func largestPlayableIndex(files []*torrent.File) int {
+	bestIdx, bestSize := -1, int64(-1)
+	fallbackIdx, fallbackSize := -1, int64(-1)
+	for i, f := range files {
+		if f.Length() > fallbackSize {
+			fallbackSize = f.Length()
+			fallbackIdx = i
+		}
+		if !videoFileExts[strings.ToLower(filepath.Ext(f.Path()))] {
+			continue
+		}
+		if f.Length() > bestSize {
+			bestSize = f.Length()
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 {
+		return bestIdx
+	}
+	return fallbackIdx
+}
+
+// urlFileIndex reads the index= query parameter out of a stream URL. GoStorm file ids are
+// 1-based ("in web id 0 is undefined", torr/torrent.go), so anything below 1 means the
+// stub does not know its file yet - which is what lazy sync writes for every stub it
+// creates without touching the swarm.
+func urlFileIndex(url string) int {
+	if !strings.Contains(url, "index=") {
+		return 0
+	}
+	iStart := strings.Index(url, "index=") + 6
+	iEnd := strings.Index(url[iStart:], "&")
+	if iEnd == -1 {
+		iEnd = len(url) - iStart
+	}
+	idx, err := strconv.Atoi(url[iStart : iStart+iEnd])
+	if err != nil {
+		return 0
+	}
+	return idx
+}
+
+// resolveTargetFile finds the torrent hash and file index for a given URL and size. The
+// third return is the resolved file's real length, or 0 when it could not be read off the
+// torrent (the URL-index fallback below). A lazily-synced stub's declared size is an
+// estimate, so a caller holding a real length should prefer it.
+func resolveTargetFile(url string, targetSize int64, physicalPath string) (string, int, int64, error) {
 	if nativeBridge == nil {
-		return "", 0, fmt.Errorf("nativeBridge is nil")
+		return "", 0, 0, fmt.Errorf("nativeBridge is nil")
 	}
 	if strings.Contains(url, "link=") {
 		start := strings.Index(url, "link=") + 5
@@ -256,6 +421,7 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 		}
 		hashStr := url[start : start+end]
 		hash := metainfo.NewHashFromHex(hashStr)
+		urlFileIdx := urlFileIndex(url)
 
 		t := web.BTS.GetTorrent(hash)
 
@@ -293,57 +459,50 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 
 					// Check for suffix match or base name match after normalization
 					if strings.HasSuffix(cleanPhys, cleanTorr) || strings.HasSuffix(cleanTorr, cleanPhys) || cleanTorr == cleanPhys {
-						return hashStr, i + 1, nil
+						return hashStr, i + 1, f.Length(), nil
 					}
 				}
 			}
 
 			// Single size match: trust it even when name normalization fails (e.g. Plex renames).
 			if matchesBySize == 1 {
-				return hashStr, sizeMatchIndex, nil
+				return hashStr, sizeMatchIndex, files[sizeMatchIndex-1].Length(), nil
 			}
 
-			// No exact size match at all: targetSize is a lazy-sync estimate (indexer-
-			// reported or a flat default), not the torrent's real file size, so it was
-			// never going to match byte-for-byte. Fall back to the largest actual video
-			// file in the torrent — the same heuristic eager sync used to pick a file
-			// before this stub existed. Beats trusting url's index=0 default blind,
-			// which fails outright on any torrent whose video isn't its first file
-			// (sample.mkv, NFO, subs bundled alongside it).
-			if matchesBySize == 0 {
-				bestIdx, bestSize := -1, int64(-1)
-				for i, f := range files {
-					ext := strings.ToLower(filepath.Ext(f.Path()))
-					if ext != ".mkv" && ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".m4v" {
-						continue
-					}
-					if f.Length() > bestSize {
-						bestSize = f.Length()
-						bestIdx = i
-					}
-				}
-				if bestIdx >= 0 {
-					return hashStr, bestIdx + 1, nil
+			// No single size match: targetSize is a lazy-sync estimate (indexer-reported
+			// or a flat default), not the torrent's real file size, so it was never going
+			// to match byte-for-byte and matchesBySize is 0 for every lazily-created stub.
+			// Fall back to the largest actual video file in the torrent — the same
+			// heuristic eager sync used to pick a file before this stub existed. Beats
+			// trusting url's index=0 default blind, which fails outright on any torrent
+			// whose video isn't its first file (sample.mkv, NFO, subs bundled alongside).
+			// Only overrides a usable url index when nothing matched by size at all: on an
+			// eager stub the recorded index was read off this same torrent at sync time and
+			// stays authoritative when two files happen to share the recorded size.
+			if matchesBySize == 0 || urlFileIdx < 1 {
+				if idx := largestPlayableIndex(files); idx >= 0 {
+					return hashStr, idx + 1, files[idx].Length(), nil
 				}
 			}
 		}
 
-		// Fallback: extract index from URL if torrent not in RAM or name match failed.
-		// Wake() will perform full discovery later.
-		urlFileIdx := 0
-		if strings.Contains(url, "index=") {
-			iStart := strings.Index(url, "index=") + 6
-			iEnd := strings.Index(url[iStart:], "&")
-			if iEnd == -1 {
-				iEnd = len(url) - iStart
-			}
-			if idx, err := strconv.Atoi(url[iStart : iStart+iEnd]); err == nil {
-				urlFileIdx = idx
-			}
+		// Fallback: the index the URL carries, for when the torrent isn't in RAM or nothing
+		// in it matched. Wake() will perform full discovery later.
+		if urlFileIdx >= 1 {
+			// files is empty or nothing matched, so no real length is available here.
+			return hashStr, urlFileIdx, 0, nil
 		}
-		return hashStr, urlFileIdx, nil
+
+		// index=0 is what lazy sync writes for a stub whose file it never looked at, and
+		// GoStorm file ids are 1-based ("in web id 0 is undefined", torr/torrent.go).
+		// Returning it as if resolved pins the handle to an id Stream() rejects outright
+		// ("file with id 0 not found") for the life of that handle — playback resolves
+		// metadata fine and then spins forever. Report it unresolved instead: the caller
+		// falls back to the cache/retry path and re-resolves once the torrent's file list
+		// is actually in RAM.
+		return "", 0, 0, fmt.Errorf("file index unknown for %s: torrent not in RAM yet", hashStr)
 	}
-	return "", 0, fmt.Errorf("file not found in torrent")
+	return "", 0, 0, fmt.Errorf("file not found in torrent")
 }
 
 // promoteFallbackCandidate rewrites a stub's on-disk JSON so a working fallback
@@ -368,6 +527,120 @@ func promoteFallbackCandidate(path, imdbID string, working vfs.FallbackCandidate
 	if os.WriteFile(tmp, jsonData, 0644) == nil {
 		os.Rename(tmp, path)
 	}
+}
+
+// shortHash truncates an infohash for logging. The hashes reaching the FUSE layer come from
+// stub files written by sync, which is remote indexer data one step removed: a malformed one
+// slicing [:8] would panic on a goroutine serving a read, and there is no recover on that
+// path — the process dies over a log line.
+func shortHash(h string) string {
+	if len(h) <= 8 {
+		return h
+	}
+	return h[:8]
+}
+
+// resolvedTarget is what play-time resolution learned about a lazily-synced stub: which file
+// in the torrent it actually names, and how long that file really is.
+type resolvedTarget struct {
+	fileID int
+	size   int64
+}
+
+// resolvedTargets caches that per stub path, for the life of the process.
+//
+// Deliberately not written back into the stub's URL: a file's inode is derived from
+// (infohash, index) (vfs.GenerateFileInode), so rewriting index=0 to the resolved id would
+// change the inode of a file the kernel, Samba and the media server already have cached.
+// Kept in memory, the warmup lookup lines up with the (hash, fileID) key the writes use from
+// the second open onward, and a restart costs one slow open per title - not a changed
+// identity for every one of them.
+var resolvedTargets sync.Map // path -> resolvedTarget
+
+func rememberResolvedTarget(path string, fileID int, size int64) {
+	if fileID < 1 {
+		return
+	}
+	resolvedTargets.Store(path, resolvedTarget{fileID: fileID, size: size})
+}
+
+func lookupResolvedTarget(path string) (resolvedTarget, bool) {
+	if v, ok := resolvedTargets.Load(path); ok {
+		return v.(resolvedTarget), true
+	}
+	return resolvedTarget{}, false
+}
+
+// persistResolvedSize rewrites a stub's declared size with the torrent file's real length.
+// A lazy stub carries an estimate - the indexer's number, or a flat default by resolution -
+// and that estimate is what Getattr reports to the media server and what bounds every read
+// (readInner refuses off >= h.size). Too small truncates playback partway; too large lets the
+// player seek past the end of a file that was never that long. The real length is only known
+// once the torrent's file list is in RAM, which is exactly here. Only the size field is
+// touched, so url/magnet/imdb/fallbacks survive, and the mtime is restored so the correction
+// doesn't read as a content change. A legacy line-format stub is left alone.
+func persistResolvedSize(path string, realSize int64) bool {
+	// Outside the range ReadMetadataFromFile accepts the stub would stop parsing at all,
+	// which is worse than a wrong size: the title would vanish from the library.
+	if realSize < vfs.MinFileSize || realSize > vfs.MaxFileSize {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return false
+	}
+	if old, ok := obj["size"].(float64); ok && int64(old) == realSize {
+		return false
+	}
+	obj["size"] = realSize
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return false
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return false
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return false
+	}
+	os.Chtimes(path, time.Now(), info.ModTime())
+	logger.Printf("[LazyStub] Corrected declared size to %.2fGB for %s",
+		float64(realSize)/(1<<30), filepath.Base(path))
+	return true
+}
+
+// refreshCachedMeta replaces the metaCache entry for a path. The *vfs.Metadata a node holds
+// is the shared cache entry, read concurrently by Getattr and Readdir, so writing through it
+// is a data race - and the stale copy would outlive this Open anyway. Replacing the entry
+// leaves existing readers on the old immutable struct and points every later lookup at the
+// new one.
+func refreshCachedMeta(old *vfs.Metadata, url string, size int64, fallbacks []vfs.FallbackCandidate) {
+	if old == nil || metaCache == nil {
+		return
+	}
+	fresh := &vfs.Metadata{
+		URL:       url,
+		Path:      old.Path,
+		ImdbID:    old.ImdbID,
+		Size:      size,
+		Mtime:     old.Mtime,
+		Fallbacks: fallbacks,
+	}
+	metaCache.Put(fresh.Path, fresh, approximateMetadataSize(fresh))
 }
 
 // Fast deterministic inode from FNV-1a hash to avoid syscalls in Readdir.
@@ -899,20 +1172,41 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		oldTimer.(*time.Timer).Stop()
 	}
 
-	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(n.vMeta.URL)
+	// n.vMeta is the entry metaCache hands out, shared by every node and read concurrently
+	// by Getattr/Readdir. The fallback switch below must not write through it: the effective
+	// release for this Open lives in these locals, and a promotion replaces the cache entry
+	// wholesale instead of mutating the struct under other readers.
+	effURL, effSize, effFallbacks := n.vMeta.URL, n.vMeta.Size, n.vMeta.Fallbacks
+
+	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(effURL)
+
+	// A lazy stub's index=0 is not a file id at all (ids are 1-based) but a marker that sync
+	// never opened the torrent, and its size is an estimate. Both are corrected by the first
+	// play-time resolution and remembered per path, so use what that learned.
+	probeIdx := urlFileIdx
+	if rt, ok := lookupResolvedTarget(n.vMeta.Path); ok {
+		probeIdx = rt.fileID
+		if rt.size > 0 {
+			effSize = rt.size
+		}
+	}
 
 	// hasFullWarmup: Open returns instantly only if both head and tail warmup files are ready.
 	// headReady: Allows async Wake and direct ID injection for instant start.
+	// Warmup files are keyed by (hash, fileID) with the resolved, 1-based id, so probing with
+	// an unresolved 0 looks up a key nothing ever writes: it reported a permanent cache miss
+	// for every lazily-synced title and, when it did hit, the shortcut below injected 0 as the
+	// handle's fileID.
 	headReady := false
 	tailReady := false
-	if warmup.DiskWarmup != nil && hashStr != "" {
-		headReady = warmup.DiskWarmup.GetAvailableRange(hashStr, urlFileIdx) > 0
-		tailReady = warmup.DiskWarmup.TailReady(hashStr, urlFileIdx)
+	if warmup.DiskWarmup != nil && hashStr != "" && probeIdx >= 1 {
+		headReady = warmup.DiskWarmup.GetAvailableRange(hashStr, probeIdx) > 0
+		tailReady = warmup.DiskWarmup.TailReady(hashStr, probeIdx)
 	}
-	ttffRegister(n.vMeta.Path, n.vMeta.Size, hashStr, headReady, tailReady)
+	ttffRegister(n.vMeta.Path, effSize, hashStr, headReady, tailReady)
 
-	magnetCandidate := n.vMeta.URL
-	if hashStr != "" && (strings.HasPrefix(n.vMeta.URL, "http://") || strings.HasPrefix(n.vMeta.URL, "https://")) {
+	magnetCandidate := effURL
+	if hashStr != "" && (strings.HasPrefix(effURL, "http://") || strings.HasPrefix(effURL, "https://")) {
 		magnetCandidate = "magnet:?xt=urn:btih:" + hashStr
 	}
 
@@ -928,20 +1222,25 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			// window, try each fallback in turn and promote whichever works so future opens
 			// go straight to it instead of retrying a dead release.
 			primaryTimeout := 45 * time.Second
-			if len(n.vMeta.Fallbacks) > 0 {
+			if len(effFallbacks) > 0 {
 				primaryTimeout = 25 * time.Second
 			}
 			if err := nativeBridge.Wake(magnetCandidate, urlFileIdx, primaryTimeout); err != nil {
-				for i, fb := range n.vMeta.Fallbacks {
+				for i, fb := range effFallbacks {
 					if fbErr := nativeBridge.Wake("magnet:?xt=urn:btih:"+fb.Hash, fb.Index, 25*time.Second); fbErr == nil {
-						remaining := append([]vfs.FallbackCandidate{}, n.vMeta.Fallbacks[i+1:]...)
+						remaining := append([]vfs.FallbackCandidate{}, effFallbacks[i+1:]...)
 						logger.Printf("[Fallback] %s unresponsive, switched to alternate release %s", filepath.Base(n.vMeta.Path), fb.Hash)
 						hashStr, urlFileIdx = fb.Hash, fb.Index
 						magnetCandidate = "magnet:?xt=urn:btih:" + fb.Hash
-						n.vMeta.URL = fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, fb.Hash, fb.Index)
-						n.vMeta.Size = fb.Size
-						n.vMeta.Fallbacks = remaining
+						effURL = fmt.Sprintf("%s/stream?link=%s&index=%d&play", gc().GoStormBaseURL, fb.Hash, fb.Index)
+						effSize = fb.Size
+						effFallbacks = remaining
 						promoteFallbackCandidate(n.vMeta.Path, n.vMeta.ImdbID, fb, remaining)
+						refreshCachedMeta(n.vMeta, effURL, effSize, remaining)
+						// The remembered id and length belong to the release just abandoned;
+						// this path now names a different torrent. Drop it so nothing probes
+						// warmup with it before the resolve below refills it.
+						resolvedTargets.Delete(n.vMeta.Path)
 						break
 					}
 				}
@@ -989,21 +1288,37 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 
 	if headReady && hashStr != "" {
 		finalHash = hashStr
-		fileIdx = urlFileIdx
+		fileIdx = probeIdx
 		isNative = true
 	} else {
 		var err error
-		finalHash, fileIdx, err = resolveTargetFile(n.vMeta.URL, n.vMeta.Size, n.vMeta.Path)
+		var realSize int64
+		finalHash, fileIdx, realSize, err = resolveTargetFile(effURL, effSize, n.vMeta.Path)
 		isNative = (err == nil)
 		if !isNative && gc().LogLevel == "DEBUG" {
 			logger.Printf("[NativeBridge] Resolution failed for %s: %v. Access will rely on cache/retry.", filepath.Base(n.vMeta.Path), err)
 		}
+		if isNative {
+			// Remember the id so the next open can probe warmup under the key the writes
+			// use, instead of re-resolving and re-warming from scratch every time.
+			rememberResolvedTarget(n.vMeta.Path, fileIdx, realSize)
+
+			// The stub's declared size is an estimate until the torrent's file list is in
+			// RAM. Now that it is, correct it: that number bounds every read and is what
+			// the media server was told the file is.
+			if realSize > 0 && realSize != effSize {
+				effSize = realSize
+				if persistResolvedSize(n.vMeta.Path, realSize) {
+					refreshCachedMeta(n.vMeta, effURL, effSize, effFallbacks)
+				}
+			}
+		}
 	}
 
 	h := &MkvHandle{
-		url:              n.vMeta.URL,
+		url:              effURL,
 		magnet:           magnetCandidate, // Store for potential re-wake
-		size:             n.vMeta.Size,
+		size:             effSize,
 		path:             n.vMeta.Path,
 		lastTime:         now,
 		lastOff:          -1,
@@ -1016,7 +1331,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		h.hash = finalHash
 		h.fileID = fileIdx
 		// media.stop only knows the path; keep what EnsureTail needs to reach the file.
-		tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: n.vMeta.Size})
+		tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: effSize})
 		// Gillian: proactive pump start at Open() — pump ready before first Read().
 		// pumpOnce ensures single start; late rescue path in Read() handles hash=='' case.
 		h.pumpOnce.Do(func() {
@@ -1125,7 +1440,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		}
 		anyHealthyPlayback := false
 		playbackRegistry.Range(func(_, v interface{}) bool {
-			if ps, ok := v.(*PlaybackState); ok && ps.IsHealthy {
+			if ps, ok := v.(*PlaybackState); ok && ps.GetStatus() {
 				anyHealthyPlayback = true
 				return false
 			}
@@ -1174,12 +1489,11 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 	// Release mutex before blocking on semaphore to avoid holding it during I/O.
 	pumpCreationMu.Unlock()
 
-	select {
-	case masterDataSemaphore <- struct{}{}:
+	if tryAcquireDataSlot() {
 		// Double-check activePumps after acquiring semaphore (another goroutine may have created it).
 		pumpCreationMu.Lock()
 		if val, ok := activePumps.Load(h.path); ok {
-			<-masterDataSemaphore
+			releaseDataSlot()
 			ps := val.(*NativePumpState)
 			newRefs := atomic.AddInt32(&ps.refCount, 1)
 			h.mu.Lock()
@@ -1316,7 +1630,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		safeGo(func() {
 			h.nativePump(pumpCtx, pumpStart, capturedState)
 		})
-	default:
+	} else {
 		// If slots are full, it will fall back to per-request slots in Read
 		logger.Printf("[MasterSemaphore] Limit reached, %s will use Fallback mode", filepath.Base(h.path))
 	}
@@ -1332,11 +1646,16 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 	}
 
 	if h.hash == "" {
-		// Late hash resolution for handles where Open() didn't complete it.
-		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
+		// Late hash resolution for handles where Open() didn't complete it. Written under
+		// h.mu: the pump runs on its own goroutine and readInner reads and writes the same
+		// two fields under that lock.
+		if hash, fileID, realSize, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
+			h.mu.Lock()
 			h.hash = hash
 			h.fileID = fileID
-			logger.Printf("[Pump] Late resolution success: %s", h.hash[:8])
+			h.mu.Unlock()
+			rememberResolvedTarget(h.path, fileID, realSize)
+			logger.Printf("[Pump] Late resolution success: %s", shortHash(hash))
 		} else {
 			logger.Printf("[Pump] Warning: hash empty for %s, warmup disabled", filepath.Base(h.path))
 		}
@@ -1367,12 +1686,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 		}
 
 		if h.hasSlot {
-			select {
-			case <-masterDataSemaphore:
-				// Slot released
-			default:
-				// Should not happen
-			}
+			releaseDataSlot()
 			h.hasSlot = false
 		}
 		pumpReader.Close()
@@ -2077,10 +2391,13 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	h.mu.Lock()
 	// Late hash recovery: if Open() failed to resolve (metadata lag), retry now.
 	if h.hash == "" && h.url != "" {
-		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
+		if hash, fileID, realSize, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
-			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), h.hash[:8])
+			// h.size is fixed for the life of the handle (read all over readInner without
+			// the lock), so a corrected length only takes effect from the next Open.
+			rememberResolvedTarget(h.path, fileID, realSize)
+			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), shortHash(h.hash))
 			go h.pumpOnce.Do(func() {
 				h.startNativePump(h.hash, h.fileID)
 			})
@@ -2160,12 +2477,11 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 					// inside the goroutine meant a goroutine was created only to sit blocked for
 					// up to 300ms doing nothing. A `default` check costs microseconds and avoids
 					// the spawn entirely when there's no room, without blocking this Read() call.
-					select {
-					case masterDataSemaphore <- struct{}{}:
+					if tryAcquireDataSlot() {
 						goOff, goKey, goHash, goFileID, goSize := warmStart, warmKey, h.hash, h.fileID, h.size
 						safeGo(func() {
 							defer inFlightPrefetches.Delete(goKey)
-							defer func() { <-masterDataSemaphore }()
+							defer releaseDataSlot()
 							fetchEnd := goOff + warmChunk - 1
 							if fetchEnd >= goSize {
 								fetchEnd = goSize - 1
@@ -2185,7 +2501,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 								logger.Printf("[WarmLanding] Pre-fetched chunk at %dMB for new handle", goOff/(1024*1024))
 							}
 						})
-					default:
+					} else {
 						inFlightPrefetches.Delete(warmKey)
 					}
 				}
@@ -2236,12 +2552,11 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 				if _, loaded := inFlightPrefetches.LoadOrStore(warmKey, true); !loaded {
 					// See the matching comment on the other WarmLanding site above: non-blocking
 					// slot check before spawning avoids creating a goroutine that just blocks.
-					select {
-					case masterDataSemaphore <- struct{}{}:
+					if tryAcquireDataSlot() {
 						goOff, goKey, goHash, goFileID, goSize := warmStart, warmKey, h.hash, h.fileID, h.size
 						safeGo(func() {
 							defer inFlightPrefetches.Delete(goKey)
-							defer func() { <-masterDataSemaphore }()
+							defer releaseDataSlot()
 							fetchEnd := goOff + warmChunk - 1
 							if fetchEnd >= goSize {
 								fetchEnd = goSize - 1
@@ -2261,7 +2576,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 								logger.Printf("[WarmLanding] Pre-fetched chunk at %dMB for seek target", goOff/(1024*1024))
 							}
 						})
-					default:
+					} else {
 						inFlightPrefetches.Delete(warmKey)
 					}
 				}
@@ -2354,11 +2669,10 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 				if fetchEnd <= goStart {
 					inFlightPrefetches.Delete(prefetchKey)
 				} else {
-					select {
-					case masterDataSemaphore <- struct{}{}:
+					if tryAcquireDataSlot() {
 						safeGo(func() {
 							defer inFlightPrefetches.Delete(goKey)
-							defer func() { <-masterDataSemaphore }()
+							defer releaseDataSlot()
 
 							if goHash != "" {
 								bufPtr := readBufferPool.Get().(*[]byte)
@@ -2376,7 +2690,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 							}
 							// HTTP Fallback REMOVED
 						})
-					default:
+					} else {
 						inFlightPrefetches.Delete(prefetchKey)
 					}
 				}
@@ -2397,8 +2711,8 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	isStreaming := (len(dest) >= int(gc().StreamingThreshold)) || isSeq
 	timing.IsStreaming = isStreaming
 
-	fetchEnd := end
-	var fetchSize int64 = int64(target)
+	// fetchEnd only feeds fetchSize; a non-streaming read fetches exactly what was asked for.
+	fetchSize := int64(target)
 	if isStreaming {
 		raSize := int64(gc().ReadAheadBase)
 
@@ -2406,7 +2720,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			raSize = int64(gc().ReadAheadInitial)
 		}
 
-		fetchEnd = off + raSize - 1
+		fetchEnd := off + raSize - 1
 		if fetchEnd >= h.size {
 			fetchEnd = h.size - 1
 		}
@@ -2442,8 +2756,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			if isStreaming && h.hash != "" {
 				if val, ok := playbackRegistry.Load(h.path); ok {
 					if ps, ok := val.(*PlaybackState); ok && (ps.GetStatus() || ps.IsInferredPlayback()) {
-						select {
-						case masterDataSemaphore <- struct{}{}:
+						if tryAcquireDataSlot() {
 							h.hasSlot = true
 							h.nativeReader = nativeBridge.NewStreamReader(h.hash, h.fileID, h.size)
 							pumpCtx, pumpCancel := context.WithCancel(context.Background())
@@ -2464,16 +2777,15 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 							hHash := metainfo.NewHashFromHex(h.hash)
 							if t := web.BTS.GetTorrent(hHash); t != nil {
 								t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
-								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", h.hash[:8])
+								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", shortHash(h.hash))
 							}
 
 							upgradedState := sharedState
 							safeGo(func() {
 								h.nativePump(pumpCtx, off, upgradedState)
 							})
-						default:
-							// Reserve full, stay in burst mode for now
 						}
+						// No slot: stay in burst mode for now.
 					}
 				}
 			}
@@ -2482,15 +2794,11 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 
 		// If still no slot (scan or reserve full), acquire a temporary slot for this read
 		if !h.hasSlot {
-			select {
-			case masterDataSemaphore <- struct{}{}:
-				defer func() { <-masterDataSemaphore }()
-			case <-fuseCtx.Done():
-				return nil, syscall.EINTR
-			case <-time.After(30 * time.Second):
-				logger.Printf("[MasterSemaphore] Timeout waiting for slot: %s", filepath.Base(h.path))
-				return nil, syscall.ETIMEDOUT
+			ok, errno := waitForDataSlot(fuseCtx, 30*time.Second, h.path)
+			if !ok {
+				return nil, errno
 			}
+			defer releaseDataSlot()
 		}
 	}
 
@@ -2695,10 +3003,9 @@ DATA_READY:
 							return
 						}
 
-						select {
-						case masterDataSemaphore <- struct{}{}:
-							defer func() { <-masterDataSemaphore }()
-						default:
+						if tryAcquireDataSlot() {
+							defer releaseDataSlot()
+						} else {
 							return // Skip if pool is saturated
 						}
 
@@ -2770,7 +3077,7 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			// This survives long pauses, buffering gaps, and Apple TV re-reads without
 			// killing the pump and causing freeze on resume.
 			if pbVal, ok := playbackRegistry.Load(h.path); ok {
-				if pbState := pbVal.(*PlaybackState); pbState.IsHealthy {
+				if pbState := pbVal.(*PlaybackState); pbState.GetStatus() {
 					logger.Printf("[V306] Healthy playback — pump stays alive (no grace period) for %s", filepath.Base(h.path))
 					// Stop any pending grace timer from a previous release cycle
 					if oldTimer, ok := pumpTimers.LoadAndDelete(h.path); ok {
@@ -2783,7 +3090,7 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			// Grace period: 30s for unconfirmed probes/scans.
 			graceDuration := 30 * time.Second
 			if pbVal, ok := playbackRegistry.Load(h.path); ok {
-				if pbState := pbVal.(*PlaybackState); !pbState.ConfirmedAt.IsZero() {
+				if pbState := pbVal.(*PlaybackState); pbState.EverConfirmed() {
 					graceDuration = 90 * time.Second
 					if pbState.IsInferredPlayback() {
 						graceDuration = 5 * time.Minute // V750
@@ -2887,10 +3194,13 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 					// Fast-drop scanner handles never confirmed by webhook.
 					scannerDrop := false
 					if h.hasWarmup && isProbeOnly {
+						// Both fields under one lock: IsHealthy used to be read after the
+						// RLock had already been released, racing the webhook handler.
 						state.mu.RLock()
 						everConfirmed := !state.ConfirmedAt.IsZero()
+						healthy := state.IsHealthy
 						state.mu.RUnlock()
-						if !state.IsHealthy && !everConfirmed {
+						if !healthy && !everConfirmed {
 							scannerDrop = true
 						}
 					}
@@ -2946,14 +3256,7 @@ func getOrReadMeta(path string) (*vfs.Metadata, error) {
 				return nil, err
 			}
 
-			m = &vfs.Metadata{
-				URL:       fileMeta.URL,
-				Size:      fileMeta.Size,
-				Mtime:     fileMeta.Mtime,
-				Path:      fileMeta.Path,
-				ImdbID:    fileMeta.ImdbID,
-				Fallbacks: fileMeta.Fallbacks,
-			}
+			m = fileMeta.ToMetadata()
 
 			metaCache.Put(path, m, approximateMetadataSize(m))
 		}
@@ -3567,7 +3870,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			state := value.(*PlaybackState)
 
 			// Tentativo 0a: Match per IMDB ID (V281 — immune a titoli localizzati)
-			if webhookImdbID != "" && state.ImdbID != "" && state.ImdbID == webhookImdbID {
+			if stateImdb := state.GetImdbID(); webhookImdbID != "" && stateImdb != "" && stateImdb == webhookImdbID {
 				exactMatch = path
 				exactState = state
 				return false
@@ -3610,7 +3913,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				playbackRegistry.Range(func(key, value interface{}) bool {
 					path := key.(string)
 					state := value.(*PlaybackState)
-					if strings.Contains(path, sectionDir) && state.ImdbID == "" {
+					if strings.Contains(path, sectionDir) && state.GetImdbID() == "" {
 						bootPath = path
 						bootState = state
 						bootCount++
@@ -3729,7 +4032,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			path := key.(string)
 			state := value.(*PlaybackState)
 
-			if stopImdbID != "" && state.ImdbID != "" && state.ImdbID == stopImdbID {
+			if stateImdb := state.GetImdbID(); stopImdbID != "" && stateImdb != "" && stateImdb == stopImdbID {
 				stopMatch = path
 				stopState = state
 				return false
@@ -4028,7 +4331,7 @@ func main() {
 	go registry.StartRegistryWatchdog(backgroundStopChan)
 	go natpmp.NatpmpLoop(backgroundStopChan, gc().NatPMP, logger)
 
-	masterDataSemaphore = make(chan struct{}, gc().MasterConcurrencyLimit)
+	masterDataSemaphore = make(chan struct{}, dataSlotHeadroom)
 	startHandleGC()
 
 	// Initialize global helpers

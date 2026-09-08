@@ -37,6 +37,24 @@ type FileMetadata struct {
 	Fallbacks []FallbackCandidate
 }
 
+// ToMetadata converts the parsed file into the cache layer's representation. Both the FUSE
+// lookup path and the startup pre-population go through here so a field added to Metadata
+// cannot be filled in by one and silently dropped by the other - which is how the play-time
+// fallback list came to be missing for every file present at startup.
+func (f *FileMetadata) ToMetadata() *Metadata {
+	if f == nil {
+		return nil
+	}
+	return &Metadata{
+		URL:       f.URL,
+		Size:      f.Size,
+		Mtime:     f.Mtime,
+		Path:      f.Path,
+		ImdbID:    f.ImdbID,
+		Fallbacks: f.Fallbacks,
+	}
+}
+
 // Validation constants
 const (
 	MinFileSize = 100 * 1024 * 1024        // 100 MB minimum

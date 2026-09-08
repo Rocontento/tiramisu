@@ -260,11 +260,9 @@ func (cm *CleanupManager) runCleanup() {
 			// 2. ConfirmedAt (Plex Webhook)
 			// 3. File Activity (Read operations)
 
-			lastActivity := ps.OpenedAt
-
-			if !ps.ConfirmedAt.IsZero() && ps.ConfirmedAt.After(lastActivity) {
-				lastActivity = ps.ConfirmedAt
-			}
+			// Read through the accessor: the webhook handler writes ConfirmedAt and Open
+			// writes OpenedAt while this loop scans, so a bare read races them.
+			lastActivity := ps.LastSignOfLife()
 
 			// Check file read activity (for non-Plex players like VLC)
 			if act, ok := cm.GetLastActivity(path); ok && act.After(lastActivity) {
@@ -279,7 +277,7 @@ func (cm *CleanupManager) runCleanup() {
 					if t := torr.PeekTorrent(ps.Hash); t != nil && t.Torrent != nil && t.IsPriority.Load() {
 						t.IsPriority.Store(false)
 						t.SetAggressiveMode(false, 0)
-						cm.logger.Printf("[V273] Force Priority OFF for zombie torrent: %s", ps.Hash[:8])
+						cm.logger.Printf("[V273] Force Priority OFF for zombie torrent: %s", shortHash(ps.Hash))
 					}
 				}
 				playbackRegistry.Delete(key)
@@ -293,7 +291,7 @@ func (cm *CleanupManager) runCleanup() {
 		}
 
 		// Remove entries older than 24h (just in case)
-		if now.Sub(ps.OpenedAt) > 24*time.Hour {
+		if now.Sub(ps.GetOpenedAt()) > 24*time.Hour {
 			playbackRegistry.Delete(key)
 			stats.PlaybackRegistryPruned++
 			// V750: Also remove from SQLite

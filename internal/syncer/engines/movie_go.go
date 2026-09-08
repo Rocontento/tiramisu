@@ -22,6 +22,7 @@ import (
 	"tiramisu/internal/catalog/torrentio"
 	"tiramisu/internal/config"
 	"tiramisu/internal/prowlarr"
+	"tiramisu/internal/vfs"
 )
 
 // MovieGoEngine is the pure Go implementation of movie sync.
@@ -517,12 +518,28 @@ const mMovieMaxFallbacks = 3
 // classifyMovieStream) — real size is unknown until play-time verification anyway.
 func estimateFileSize(c MovieStream) int64 {
 	if c.SizeGB > 0 {
-		return int64(c.SizeGB * 1024 * 1024 * 1024)
+		return clampStubSize(int64(c.SizeGB * 1024 * 1024 * 1024))
 	}
 	if c.Is4K {
 		return 15 * 1024 * 1024 * 1024
 	}
 	return 4 * 1024 * 1024 * 1024
+}
+
+// clampStubSize keeps an estimated size inside the range a stub can be read back at.
+// ReadMetadataFromFile rejects anything outside 100MB..100GB outright, and a stub it
+// rejects is not a smaller file — it fails to resolve at all, so the title shows up in
+// the library and then cannot be opened. Eager sync could never hit this because it
+// wrote the torrent's real file length; a lazy estimate comes straight from indexer
+// text and a mis-parsed or sample-sized entry lands below the floor.
+func clampStubSize(size int64) int64 {
+	if size < vfs.MinFileSize {
+		return vfs.MinFileSize
+	}
+	if size > vfs.MaxFileSize {
+		return vfs.MaxFileSize
+	}
+	return size
 }
 
 type MovieStream struct {
@@ -644,6 +661,11 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) (*MovieStream, st
 	}
 	if _, ok := e.blacklist.Hashes[strings.ToLower(s.InfoHash)]; ok {
 		return nil, "blacklist_hash"
+	}
+	// Rejected here rather than downstream: everything past this point slices the hash
+	// (filename suffix, disk-dedup key) and would panic on a malformed one.
+	if !ValidInfoHash(s.InfoHash) {
+		return nil, "bad_infohash"
 	}
 
 	seeders := e.extractMovieSeeders(title)

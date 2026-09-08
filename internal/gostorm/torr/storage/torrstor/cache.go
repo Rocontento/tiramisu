@@ -36,8 +36,11 @@ type Cache struct {
 	storage *Storage
 
 	capacity int64
-	filled   int64
-	hash     metainfo.Hash
+	// filled is written both by the cleaner goroutine and by GetState on whichever goroutine
+	// serves the status API, and read by the eviction and prefetch paths: plain field access
+	// is a data race between them.
+	filled atomic.Int64
+	hash   metainfo.Hash
 
 	pieceLength int64
 	pieceCount  int
@@ -53,8 +56,10 @@ type Cache struct {
 	isClosed     atomic.Bool
 	IsAggressive bool // V217: Aggressive download priority
 	MasterLimit  int  // V218: Master limit from config.json
-	lastClean    time.Time
-	lastEvictLog time.Time // rate-limits the starved-eviction warning
+	// lastClean is the throttle timestamp, read before muRemove is taken and written after,
+	// so it is held as UnixNano rather than a time.Time.
+	lastClean    atomic.Int64
+	lastEvictLog time.Time // rate-limits the starved-eviction warning (guarded by muRemove)
 	muRemove     sync.Mutex
 	torrent      *torrent.Torrent
 	cleanTrigger chan struct{} // V227: Rate-limited cleanup trigger (never closed — use cleanStop)
@@ -111,7 +116,6 @@ func (c *Cache) putBuffer(b []byte) {
 func NewCache(capacity int64, storage *Storage) *Cache {
 	ret := &Cache{
 		capacity:      capacity,
-		filled:        0,
 		pieces:        make(map[int]*Piece),
 		storage:       storage,
 		readers:       make(map[*Reader]struct{}),
@@ -152,10 +156,14 @@ func (c *Cache) Init(info *metainfo.Info, hash metainfo.Hash) {
 		c.freeCap = 2
 	}
 
+	// Sized before the pieces exist: the cleaner goroutine started in NewCache scans
+	// c.pieces and indexes the bitmap by piece id, so filling the map first leaves a
+	// window where every id is out of range.
+	c.pieceInRange = make([]bool, c.pieceCount)
+
 	for i := 0; i < c.pieceCount; i++ {
 		c.pieces[i] = NewPiece(i, c)
 	}
-	c.pieceInRange = make([]bool, c.pieceCount)
 }
 
 func (c *Cache) SetTorrent(torr *torrent.Torrent) {
@@ -294,7 +302,7 @@ func (c *Cache) GetState() *state.CacheState {
 		c.muReaders.RUnlock()
 	}
 
-	c.filled = fill
+	c.filled.Store(fill)
 	cState.Capacity = c.capacity
 	cState.PiecesLength = c.pieceLength
 	cState.PiecesCount = c.pieceCount
@@ -342,7 +350,7 @@ func (c *Cache) cleanPieces() {
 	// V138: Throttle eviction to at most once per second,
 	// unless we are near capacity (>90%)
 	now := time.Now()
-	if now.Sub(c.lastClean) < time.Second && c.filled < (c.capacity*9)/10 {
+	if now.Sub(time.Unix(0, c.lastClean.Load())) < time.Second && c.filled.Load() < (c.capacity*9)/10 {
 		return
 	}
 
@@ -351,15 +359,16 @@ func (c *Cache) cleanPieces() {
 		return
 	}
 	c.isRemove.Store(true)
-	c.lastClean = now
+	c.lastClean.Store(now.UnixNano())
 	defer func() {
 		c.isRemove.Store(false)
 		c.muRemove.Unlock()
 	}()
 
 	remPieces := c.getRemPieces()
-	if c.filled > c.capacity {
-		rems := (c.filled-c.capacity)/c.pieceLength + 1
+	filled := c.filled.Load()
+	if filled > c.capacity {
+		rems := (filled-c.capacity)/c.pieceLength + 1
 		// Only the starved case is worth reporting: nothing evictable while over
 		// capacity means the protected window is too wide for the configured cache
 		// and the reader will thrash. Logging every cycle floods the log at several
@@ -372,7 +381,7 @@ func (c *Cache) cleanPieces() {
 			}
 			log.TLogln("[CacheEvict] nothing evictable — readers:", readers,
 				"window(MB):", c.capacity/readers*85/100>>20,
-				"filled(MB):", c.filled>>20, "capacity(MB):", c.capacity>>20)
+				"filled(MB):", filled>>20, "capacity(MB):", c.capacity>>20)
 		}
 		for _, p := range remPieces {
 			c.removePiece(p)
@@ -411,14 +420,19 @@ func (c *Cache) getRemPieces() []*Piece {
 	ranges = mergeRange(ranges)
 
 	// V305: Rebuild bitmap for O(1) piece-in-range checks
-	fillPieceInRange(c.pieceInRange, ranges, c.pieceCount)
+	inRange := c.pieceInRange
+	fillPieceInRange(inRange, ranges, c.pieceCount)
 
 	for id, p := range pieces {
 		sz := atomic.LoadInt64(&p.Size)
 		if sz > 0 {
 			fill += sz
 		}
-		if !pieceEvictable(sz, p.Complete.Load(), c.pieceInRange[id]) {
+		// The bitmap is sized in Init, which fills c.pieces first: a clean cycle between the
+		// two - or any piece id the bitmap does not cover - must read as "not in a reader
+		// window" rather than index out of range and take the cleaner goroutine down with it.
+		protected := id < len(inRange) && inRange[id]
+		if !pieceEvictable(sz, p.Complete.Load(), protected) {
 			continue
 		}
 		if !c.isIdInFileBE(ranges, id) {
@@ -433,7 +447,7 @@ func (c *Cache) getRemPieces() []*Piece {
 		return atomic.LoadInt64(&piecesRemove[i].Accessed) < atomic.LoadInt64(&piecesRemove[j].Accessed)
 	})
 
-	c.filled = fill
+	c.filled.Store(fill)
 	return piecesRemove
 }
 
@@ -473,7 +487,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		count := effectiveLimit / numReaders
 		if c.IsAggressive {
 			// V243: Safety - If cache is overfilled, disable aggressive expansion
-			if c.filled > c.capacity {
+			if c.filled.Load() > c.capacity {
 				count = 1 // Fallback to minimal download
 			} else {
 				// V218: Aggressive but benevolent (80% rule).
