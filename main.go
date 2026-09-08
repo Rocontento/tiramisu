@@ -745,14 +745,28 @@ func fillAttrFromStat(st *syscall.Stat_t, out *fuse.Attr) {
 }
 
 // fillAttrFromMetadata populates FUSE attributes from our internal Metadata.
+//
+// A lazy stub's declared size is an estimate (the indexer's number, or a flat default by
+// resolution) until the first play resolves the torrent's real file length. That correction
+// is written back into the stub and into metaCache, but a VirtualMkvNode built before it
+// keeps the *vfs.Metadata it was constructed with - so stat() went on reporting the estimate
+// for the life of that inode while every read was bounded by the corrected length. The media
+// server is then told the file is bigger than it is (indexer sizes cover the whole torrent,
+// the flat defaults are 4GB/15GB), seeks into the tail for the MKV Cues, and reads past the
+// end: FUSE hands back EOF and the player errors out on a file it was told was longer.
+// resolvedTargets holds the real length once resolution has happened, so it wins here.
 func fillAttrFromMetadata(m *vfs.Metadata, out *fuse.Attr) {
-	out.Size = uint64(m.Size)
+	size := m.Size
+	if rt, ok := lookupResolvedTarget(m.Path); ok && rt.size > 0 {
+		size = rt.size
+	}
+	out.Size = uint64(size)
 	out.Mode = syscall.S_IFREG | 0644
 	out.Uid, out.Gid = gc().UID, gc().GID
 	out.Nlink = 1
 	// out.Blksize = 4096                                 // Standard block size
-	out.Blksize = uint32(gc().FuseBlockSize)  // Configurable block size (default 1MB)
-	out.Blocks = (uint64(m.Size) + 511) / 512 // Estimate blocks based on size
+	out.Blksize = uint32(gc().FuseBlockSize) // Configurable block size (default 1MB)
+	out.Blocks = (uint64(size) + 511) / 512  // Estimate blocks based on size
 
 	ts := sanitizeTime(m.Mtime)
 	out.Mtime = ts
@@ -1156,6 +1170,21 @@ func (n *VirtualMkvNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse
 	return 0
 }
 
+// openWakeBudget bounds the total time Open may spend waiting for torrent metadata. It is
+// spent inside the FUSE open() the media server is blocked on, and a player's opener gives
+// up well before a minute. Whatever has not woken inside the budget keeps waking in the
+// background: readInner's late-resolution path picks it up on a later read, and the next
+// open finds the torrent already in RAM.
+const openWakeBudget = 20 * time.Second
+
+// openWakePrimaryShare is the slice of that budget the primary release gets before the
+// fallbacks are given the rest. Only applies when there are fallbacks to give it to.
+const openWakePrimaryShare = 12 * time.Second
+
+// minFallbackWake is the shortest window worth handing a fallback: below it a metadata
+// handshake cannot realistically complete, so the wait only burns budget.
+const minFallbackWake = 4 * time.Second
+
 func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if gc().LogLevel == "DEBUG" {
 		logger.Printf("=== OPEN VIRTUAL === path=%s", n.vMeta.Path)
@@ -1221,14 +1250,44 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			// at sync time (see MovieSync). If the primary doesn't answer within a bounded
 			// window, try each fallback in turn and promote whichever works so future opens
 			// go straight to it instead of retrying a dead release.
-			primaryTimeout := 45 * time.Second
+			//
+			// Every second spent here is spent inside the open() the media server is blocked
+			// on, so the whole sequence shares one budget (see openWakeBudget). It used to be
+			// per-call: 45s for the primary and another 25s for each of up to three fallbacks,
+			// two minutes of a single open(), which no player waits through - the title errored
+			// out long before the fallback that would have saved it was ever reached.
+			deadline := time.Now().Add(openWakeBudget)
+			primaryTimeout := openWakeBudget
 			if len(effFallbacks) > 0 {
-				primaryTimeout = 25 * time.Second
+				primaryTimeout = openWakePrimaryShare
 			}
 			if err := nativeBridge.Wake(magnetCandidate, urlFileIdx, primaryTimeout); err != nil {
+				logger.Printf("[Wake] Primary release %s did not answer within %s for %s: %v",
+					shortHash(hashStr), primaryTimeout, filepath.Base(n.vMeta.Path), err)
 				for i, fb := range effFallbacks {
-					if fbErr := nativeBridge.Wake("magnet:?xt=urn:btih:"+fb.Hash, fb.Index, 25*time.Second); fbErr == nil {
+					// Split whatever is left of the budget across the fallbacks still to try,
+					// with a floor: a window too short to complete a metadata handshake only
+					// burns the remaining time and adds a torrent nobody will use.
+					left := time.Until(deadline)
+					fbTimeout := left / time.Duration(len(effFallbacks)-i)
+					if fbTimeout < minFallbackWake {
+						fbTimeout = minFallbackWake
+					}
+					if left < minFallbackWake {
+						logger.Printf("[Wake] Open budget spent for %s, %d fallback(s) untried - the background wake continues",
+							filepath.Base(n.vMeta.Path), len(effFallbacks)-i)
+						break
+					}
+					if fbErr := nativeBridge.Wake("magnet:?xt=urn:btih:"+fb.Hash, fb.Index, fbTimeout); fbErr == nil {
+						// The primary is demoted, not discarded: this switch fires on a
+						// timeout, and a timeout is "did not answer in time", not "dead".
+						// Dropping it outright loses a release that was ranked best on
+						// indexer metadata over one slow DHT lookup, so it goes to the back
+						// of the queue and stays available to a later open.
 						remaining := append([]vfs.FallbackCandidate{}, effFallbacks[i+1:]...)
+						if hashStr != "" {
+							remaining = append(remaining, vfs.FallbackCandidate{Hash: hashStr, Index: urlFileIdx, Size: effSize})
+						}
 						logger.Printf("[Fallback] %s unresponsive, switched to alternate release %s", filepath.Base(n.vMeta.Path), fb.Hash)
 						hashStr, urlFileIdx = fb.Hash, fb.Index
 						magnetCandidate = "magnet:?xt=urn:btih:" + fb.Hash
@@ -1295,7 +1354,10 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		var realSize int64
 		finalHash, fileIdx, realSize, err = resolveTargetFile(effURL, effSize, n.vMeta.Path)
 		isNative = (err == nil)
-		if !isNative && gc().LogLevel == "DEBUG" {
+		if !isNative {
+			// Not a DEBUG-only line: an Open that gets here hands back a handle with no
+			// hash, every read on it fails, and the player shows a bare "playback error".
+			// This is the one line that says why, so it is always in the log.
 			logger.Printf("[NativeBridge] Resolution failed for %s: %v. Access will rely on cache/retry.", filepath.Base(n.vMeta.Path), err)
 		}
 		if isNative {
@@ -1308,9 +1370,12 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			// the media server was told the file is.
 			if realSize > 0 && realSize != effSize {
 				effSize = realSize
-				if persistResolvedSize(n.vMeta.Path, realSize) {
-					refreshCachedMeta(n.vMeta, effURL, effSize, effFallbacks)
-				}
+				persistResolvedSize(n.vMeta.Path, realSize)
+				// Refreshed whether or not the on-disk rewrite took: a legacy line-format
+				// stub, or one whose real length falls outside the range
+				// ReadMetadataFromFile accepts, still has to serve the corrected length
+				// from cache for the rest of this process's life.
+				refreshCachedMeta(n.vMeta, effURL, effSize, effFallbacks)
 			}
 		}
 	}
@@ -1406,6 +1471,8 @@ type MkvHandle struct {
 	pumpOnce        sync.Once
 	isPrimaryHandle atomic.Bool  // pump creator, primary reconnects (refCount 0→1), proven readers
 	seqAdvances     atomic.Int32 // consecutive sequential streaming reads, feeds the promotion below
+	rewakeOnce      sync.Once    // guards the one background wake readInner fires when Open never resolved
+	unresolvedOnce  sync.Once    // guards the one log line for a read that failed with no hash
 }
 
 // startNativePump acquires a slot and starts the background pump.
@@ -2401,6 +2468,21 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			go h.pumpOnce.Do(func() {
 				h.startNativePump(h.hash, h.fileID)
 			})
+		} else if h.magnet != "" && nativeBridge != nil {
+			// Still unresolved. Resolution only reads the torrent's file list out of RAM,
+			// so it can never succeed while nothing is putting it there - and Open's Wake
+			// may have returned an error rather than merely timing out (an AddTorrent
+			// failure, or the wake semaphore exhausted by a scan burst), in which case no
+			// torrent is being fetched at all and every read on this handle would fail
+			// forever. Kick one background wake per handle, off the read path.
+			magnet := h.magnet
+			h.rewakeOnce.Do(func() {
+				safeGo(func() {
+					if err := nativeBridge.Wake(magnet, 0, 0); err != nil {
+						logger.Printf("[LateResolution] Background wake failed for %s: %v", filepath.Base(h.path), err)
+					}
+				})
+			})
 		}
 	}
 
@@ -2947,7 +3029,21 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 		}
 	}
 
-	// If everything fails, return EAGAIN as last resort
+	// Nothing was fetched. Two different failures land here and they deserve different
+	// answers: a handle that never resolved a hash skipped the fetch above entirely and
+	// will keep skipping it until the torrent reaches RAM, which is a real I/O failure the
+	// player should see as one - EAGAIN reads as "temporarily unavailable, retry" and a
+	// blocking read has no retry, so the player just showed a bare error with nothing in
+	// the log explaining it. A resolved handle whose three fetch attempts came back empty
+	// is genuinely a "not yet" and keeps EAGAIN.
+	if h.hash == "" {
+		h.unresolvedOnce.Do(func() {
+			logger.Printf("[PlayFailed] %s has no reachable torrent: metadata never arrived for %s. "+
+				"The release is likely dead - it will be retried on the next open, and sync replaces it on the next upgrade pass.",
+				filepath.Base(h.path), h.url)
+		})
+		return nil, syscall.EIO
+	}
 	return nil, syscall.EAGAIN
 
 DATA_READY:

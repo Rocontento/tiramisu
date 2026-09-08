@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
+
 	"tiramisu/internal/config"
 	"tiramisu/internal/vfs"
 )
@@ -242,4 +244,51 @@ func TestWaitForDataSlot(t *testing.T) {
 		t.Errorf("saturated wait took %v, budget was 50ms", elapsed)
 	}
 	releaseDataSlot()
+}
+
+// A lazy stub's declared size is an estimate, and Getattr is where the media server learns
+// how long the file is. The node holds the *vfs.Metadata it was built with, so once play-time
+// resolution has the torrent's real length the attribute fill has to prefer it - otherwise
+// stat() reports the estimate while every read is bounded by the real length, and the player
+// seeks into a tail that is not there.
+func TestFillAttrPrefersResolvedSize(t *testing.T) {
+	prevCfg := globalConfig.Load()
+	defer func() {
+		if prevCfg != nil {
+			globalConfig.Store(prevCfg)
+		}
+	}()
+	globalConfig.Store(&config.Config{FuseBlockSize: 1 << 20})
+
+	const path = "/movies/TestFillAttrPrefersResolvedSize.mkv"
+	resolvedTargets.Delete(path)
+	defer resolvedTargets.Delete(path)
+
+	const estimate = int64(15 << 30)
+	const real = int64(8 << 30)
+	meta := &vfs.Metadata{Path: path, Size: estimate}
+
+	var out fuse.Attr
+	fillAttrFromMetadata(meta, &out)
+	if out.Size != uint64(estimate) {
+		t.Fatalf("with nothing resolved, Size = %d; want the stub's %d", out.Size, estimate)
+	}
+
+	rememberResolvedTarget(path, 2, real)
+	fillAttrFromMetadata(meta, &out)
+	if out.Size != uint64(real) {
+		t.Errorf("after resolution, Size = %d; want the torrent's real %d", out.Size, real)
+	}
+	if want := (uint64(real) + 511) / 512; out.Blocks != want {
+		t.Errorf("Blocks = %d; want %d, in step with the corrected size", out.Blocks, want)
+	}
+
+	// A resolved id with no length attached (the URL-index fallback in resolveTargetFile
+	// returns 0) must not blank the size out.
+	resolvedTargets.Delete(path)
+	rememberResolvedTarget(path, 2, 0)
+	fillAttrFromMetadata(meta, &out)
+	if out.Size != uint64(estimate) {
+		t.Errorf("with an unknown real length, Size = %d; want the stub's %d", out.Size, estimate)
+	}
 }
